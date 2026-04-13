@@ -337,10 +337,10 @@ class MediaConnector:
                 global_thread_pool, self._get_cached_bytes, url
             )
             if cached is not None:
-                future = loop.run_in_executor(
-                    global_thread_pool, media_io.load_bytes, cached
-                )
-                return await future
+                with record_function_or_nullcontext("media: pil_decode"):
+                    return await loop.run_in_executor(
+                        global_thread_pool, media_io.load_bytes, cached
+                    )
 
             connection = self.connection
             with record_function_or_nullcontext("media: url_download"):
@@ -353,11 +353,13 @@ class MediaConnector:
             await loop.run_in_executor(
                 global_thread_pool, self._put_cached_bytes, url, data
             )
-            future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
-            return await future
+            with record_function_or_nullcontext("media: pil_decode"):
+                return await loop.run_in_executor(
+                    global_thread_pool, media_io.load_bytes, data
+                )
 
         if url_spec.scheme == "data":
-            future = loop.run_in_executor(
+            future: asyncio.Future[_M] = loop.run_in_executor(
                 global_thread_pool, self._load_data_url, url_spec, media_io
             )
             return await future
