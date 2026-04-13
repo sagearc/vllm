@@ -226,35 +226,25 @@ tasks:
 
   _exp:capture-base64:
     internal: true
-    # Download and encode the image on the pod so the payload never crosses the
-    # local→pod boundary. Large hi-res images (several MB base64) would exceed
-    # shell ARG_MAX if constructed locally and passed via oc exec bash -c "...".
+    # Use oc port-forward so capture_request.py runs locally with --base64,
+    # downloading the image locally and sending the encoded payload to the pod.
+    # This avoids heredoc-in-YAML issues and keeps Python code out of the Taskfile.
     desc: "Profile one base64 request. Vars: IMAGE_URL, OUTDIR"
     vars:
       POD: '{{.POD | default "vllm-dev"}}'
+      LOCAL_PORT: "18000"
     cmds:
       - |
-        oc exec -i {{.POD}} -- python3 - <<'PYEOF'
-import base64, json, urllib.request as R
-
-base  = "http://localhost:{{.PORT}}"
-url   = "{{.IMAGE_URL}}"
-model = "{{.MODEL}}"
-
-b64  = base64.b64encode(R.urlopen(url).read()).decode()
-body = json.dumps({
-    "model": model,
-    "messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
-        {"type": "text", "text": "Describe this image in one sentence."},
-    ]}],
-    "max_tokens": 64,
-}).encode()
-
-R.urlopen(R.Request(f"{base}/start_profile", method="POST"))
-R.urlopen(R.Request(f"{base}/v1/chat/completions", body, {"Content-Type": "application/json"}))
-R.urlopen(R.Request(f"{base}/stop_profile", method="POST"))
-PYEOF
+        oc port-forward {{.POD}} {{.LOCAL_PORT}}:{{.PORT}} &
+        PFW=$!
+        trap "kill $PFW 2>/dev/null" EXIT
+        sleep 2
+        python3 tools/capture_request.py \
+          --endpoint http://localhost:{{.LOCAL_PORT}} \
+          --model    {{.MODEL}} \
+          --image    {{.IMAGE_URL}} \
+          --base64
+        kill $PFW 2>/dev/null || true
       - task: traces:pull
         vars: { LOCAL_TRACE_DIR: "{{.OUTDIR}}" }
       - task: traces:summary
