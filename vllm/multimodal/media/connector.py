@@ -301,12 +301,11 @@ class MediaConnector:
                 return media_io.load_bytes(cached)
 
             connection = self.connection
-            with record_function_or_nullcontext("media: url_download"):
-                data = connection.get_bytes(
-                    url_spec.url,
-                    timeout=fetch_timeout,
-                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
-                )
+            data = connection.get_bytes(
+                url_spec.url,
+                timeout=fetch_timeout,
+                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+            )
 
             self._put_cached_bytes(url, data)
             return media_io.load_bytes(data)
@@ -359,13 +358,13 @@ class MediaConnector:
                 )
 
         if url_spec.scheme == "data":
-            future: asyncio.Future[_M] = loop.run_in_executor(
-                global_thread_pool, self._load_data_url, url_spec, media_io
-            )
-            return await future
+            with record_function_or_nullcontext("media: data_decode"):
+                return await loop.run_in_executor(
+                    global_thread_pool, self._load_data_url, url_spec, media_io
+                )
 
         if url_spec.scheme == "file":
-            future = loop.run_in_executor(
+            future: asyncio.Future[_M] = loop.run_in_executor(
                 global_thread_pool, self._load_file_url, url_spec, media_io
             )
             return await future

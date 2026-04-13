@@ -881,9 +881,16 @@ class AsyncLLM(EngineClient):
         await self.engine_core.profile_async(True, profile_prefix)
 
     async def stop_profile(self) -> None:
-        await self.engine_core.profile_async(False)
+        # Stop the frontend profiler first (same thread as start(), required by
+        # kineto), then tell the engine. Doing it the other way around would
+        # leave the frontend profiler open while awaiting the engine roundtrip,
+        # capturing idle asyncio noise after the request is already done.
+        # profiler.stop() calls on_trace_ready which writes the trace file —
+        # this is blocking I/O on the event loop, but stop_profile is a debug
+        # path so the brief pause is acceptable.
         if self.profiler is not None:
             self.profiler.stop()
+        await self.engine_core.profile_async(False)
 
     async def reset_mm_cache(self) -> None:
         await self.renderer.clear_mm_cache_async()
