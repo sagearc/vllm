@@ -37,10 +37,7 @@ def _post(
     headers = {}
     if content_type:
         headers["Content-Type"] = content_type
-    req = R.Request(
-        url, data=body, headers=headers, method="POST" if body is None else None
-    )
-    req.method = "POST"
+    req = R.Request(url, data=body, headers=headers, method="POST")
     try:
         return R.urlopen(req).read()
     except URLError as e:

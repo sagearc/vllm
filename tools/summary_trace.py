@@ -9,7 +9,8 @@ Both traces use CLOCK_MONOTONIC microseconds (same machine), so timestamps
 are directly comparable — no clock conversion needed.
 
 Output tracks:
-  Frontend   — media: url_download, media: pil_decode, mm_processor: process_multimodal
+  Frontend   — media: url_download / media: data_decode,
+               media: pil_decode, mm_processor: process_multimodal
   GPU Worker — mm_encoder: forward, gpu_model_runner: forward
 
 Usage:
@@ -23,7 +24,8 @@ import json
 from pathlib import Path
 
 FRONTEND_SPANS = {
-    "media: url_download",
+    "media: url_download",  # HTTP URL path
+    "media: data_decode",  # base64 / data: URL path
     "media: pil_decode",
     "mm_processor: process_multimodal",
 }

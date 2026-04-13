@@ -13,7 +13,7 @@ vars:
   # Stable public image used for ad-hoc profiling requests
   IMAGE_URL: '{{.IMAGE_URL | default "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"}}'
   # High-res public domain image (~8 MP)
-  IMAGE_URL_HIRES: '{{.IMAGE_URL_HIRES | default "https://upload.wikimedia.org/wikipedia/commons/a/a7/Camponotus_flavomarginatus_ant.jpg"}}'
+  IMAGE_URL_HIRES: '{{.IMAGE_URL_HIRES | default "https://picsum.photos/seed/vllm/3000/2000.jpg"}}'
 
 tasks:
   default:
@@ -189,9 +189,13 @@ tasks:
     vars:
       POD: '{{.POD | default "vllm-dev"}}'
     cmds:
+      # Step 1a: kill old server.
+      # Run pkill directly (no bash -c wrapper) so the search pattern does not
+      # appear in any wrapper process's cmdline. pkill always excludes itself.
+      - oc exec {{.POD}} -- pkill -f /workspace/vllm/.venv/bin/vllm || true
+      # Step 1b: wipe old traces and launch new server (no sleep, no wait)
       - |
         oc exec {{.POD}} -- bash -c "
-          kill \$(pgrep -f 'vllm serve') 2>/dev/null || true; sleep 3
           rm -f {{.TRACE_DIR}}/*.json.gz {{.TRACE_DIR}}/*.txt
           nohup env VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 \
             HF_TOKEN='$HF_TOKEN' HUGGING_FACE_HUB_TOKEN='$HF_TOKEN' \
@@ -199,11 +203,14 @@ tasks:
             --port {{.PORT}} \
             --profiler-config '{\"profiler\":\"torch\",\"torch_profiler_dir\":\"{{.TRACE_DIR}}\",\"torch_profiler_with_stack\":{{.WITH_STACK}},\"max_iterations\":1}' \
             > /tmp/vllm-serve.log 2>&1 &
-          echo \"Server PID \$!\"
-          until curl -sf http://localhost:{{.PORT}}/v1/models > /dev/null 2>&1; do
-            sleep 5
-          done
-          echo ready"
+          echo \"Server PID \$!\""
+      # Step 2: poll locally so oc exec never sits open for 2+ minutes
+      - |
+        echo "Waiting for server on {{.POD}}:{{.PORT}}..."
+        until oc exec {{.POD}} -- curl -sf http://localhost:{{.PORT}}/v1/models > /dev/null 2>&1; do
+          sleep 10
+        done
+        echo ready
 
   _exp:capture:
     internal: true
@@ -239,7 +246,7 @@ tasks:
         PFW=$!
         trap "kill $PFW 2>/dev/null" EXIT
         sleep 2
-        python3 tools/capture_request.py \
+        {{.PYTHON}} tools/capture_request.py \
           --endpoint http://localhost:{{.LOCAL_PORT}} \
           --model    {{.MODEL}} \
           --image    {{.IMAGE_URL}} \
