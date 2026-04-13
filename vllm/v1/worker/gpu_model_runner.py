@@ -2853,7 +2853,7 @@ class GPUModelRunner(
                     video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]
                     with self.timed_encoder_operation(
                         should_time, mm_lora_refs, current_item_idx + video_idx, 1
-                    ):
+                    ), record_function_or_nullcontext("mm_encoder: forward"):
                         _, _, micro_batch_mm_inputs = next(
                             group_and_batch_mm_kwargs(
                                 [video_mm_kwargs_item],
@@ -2880,7 +2880,7 @@ class GPUModelRunner(
 
                 with self.timed_encoder_operation(
                     should_time, mm_lora_refs, current_item_idx, num_items
-                ):
+                ), record_function_or_nullcontext("mm_encoder: forward"):
                     cudagraph_output = None
                     if (
                         self.encoder_cudagraph_manager is not None

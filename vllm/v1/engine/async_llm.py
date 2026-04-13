@@ -871,16 +871,19 @@ class AsyncLLM(EngineClient):
             raise self.dead_error
 
     async def start_profile(self, profile_prefix: str | None = None) -> None:
-        coros = [self.engine_core.profile_async(True, profile_prefix)]
+        # The torch profiler must be started on the event-loop thread: kineto
+        # registers its client on the calling thread, and `record_function`
+        # calls from any other thread are silently dropped. Starting via
+        # `asyncio.to_thread` would run it on an executor worker and break all
+        # user-defined profiling scopes on the frontend.
         if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.start))
-        await asyncio.gather(*coros)
+            self.profiler.start()
+        await self.engine_core.profile_async(True, profile_prefix)
 
     async def stop_profile(self) -> None:
-        coros = [self.engine_core.profile_async(False)]
+        await self.engine_core.profile_async(False)
         if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.stop))
-        await asyncio.gather(*coros)
+            self.profiler.stop()
 
     async def reset_mm_cache(self) -> None:
         await self.renderer.clear_mm_cache_async()

@@ -23,6 +23,7 @@ import vllm.envs as envs
 from vllm.connections import HTTPConnection, global_http_connection
 from vllm.logger import init_logger
 from vllm.utils.registry import ExtensionManager
+from vllm.v1.utils import record_function_or_nullcontext
 
 from .audio import AudioEmbeddingMediaIO, AudioMediaIO
 from .base import MediaIO
@@ -300,11 +301,12 @@ class MediaConnector:
                 return media_io.load_bytes(cached)
 
             connection = self.connection
-            data = connection.get_bytes(
-                url_spec.url,
-                timeout=fetch_timeout,
-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
-            )
+            with record_function_or_nullcontext("media: url_download"):
+                data = connection.get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
 
             self._put_cached_bytes(url, data)
             return media_io.load_bytes(data)
@@ -341,11 +343,12 @@ class MediaConnector:
                 return await future
 
             connection = self.connection
-            data = await connection.async_get_bytes(
-                url_spec.url,
-                timeout=fetch_timeout,
-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
-            )
+            with record_function_or_nullcontext("media: url_download"):
+                data = await connection.async_get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
 
             await loop.run_in_executor(
                 global_thread_pool, self._put_cached_bytes, url, data
