@@ -2,13 +2,18 @@
 version: '3'
 
 vars:
-  MODEL: '{{.MODEL | default "llava-hf/llava-1.5-7b-hf"}}'
+  MODEL: '{{.MODEL | default "google/gemma-3-27b-it"}}'
   PORT: '{{.PORT | default "8000"}}'
   TRACE_DIR: '{{.TRACE_DIR | default "/tmp/vllm-traces"}}'
+  LOCAL_TRACE_DIR: '{{.LOCAL_TRACE_DIR | default "./traces"}}'
   PYTHON: .venv/bin/python
   LOG_FILE: /tmp/vllm-server.log
+  # false = only custom spans visible; true = full Python stacks (needed for flamegraph)
+  WITH_STACK: '{{.WITH_STACK | default "true"}}'
   # Stable public image used for ad-hoc profiling requests
   IMAGE_URL: '{{.IMAGE_URL | default "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"}}'
+  # High-res public domain image (~8 MP)
+  IMAGE_URL_HIRES: '{{.IMAGE_URL_HIRES | default "https://upload.wikimedia.org/wikipedia/commons/a/a7/Camponotus_flavomarginatus_ant.jpg"}}'
 
 tasks:
   default:
@@ -27,7 +32,7 @@ tasks:
         VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 \
         .venv/bin/vllm serve {{.MODEL}} \
           --port {{.PORT}} \
-          --profiler-config '{"profiler":"torch","torch_profiler_dir":"{{.TRACE_DIR}}"}' \
+          --profiler-config '{"profiler":"torch","torch_profiler_dir":"{{.TRACE_DIR}}","torch_profiler_with_stack":{{.WITH_STACK}},"max_iterations":1}' \
           2>&1 | tee {{.LOG_FILE}}
 
   serve:plain:
@@ -90,6 +95,31 @@ tasks:
 
   # ── Traces ────────────────────────────────────────────────────────────
 
+  traces:pull:
+    desc: "Copy latest traces from pod → LOCAL_TRACE_DIR (default ./traces)"
+    vars:
+      POD: '{{.POD | default "vllm-dev"}}'
+    cmds:
+      - mkdir -p {{.LOCAL_TRACE_DIR}}
+      - |
+        frontend=$(oc exec {{.POD}} -- bash -c "ls -t {{.TRACE_DIR}}/*.async_llm.*.json.gz 2>/dev/null | head -1")
+        gpu=$(oc exec {{.POD}} -- bash -c "ls -t {{.TRACE_DIR}}/rank0.*.json.gz 2>/dev/null | head -1")
+        [ -z "$frontend" ] && echo "No frontend trace found" && exit 1
+        [ -z "$gpu" ]      && echo "No GPU trace found" && exit 1
+        oc cp {{.POD}}:$frontend {{.LOCAL_TRACE_DIR}}/frontend.json.gz
+        oc cp {{.POD}}:$gpu      {{.LOCAL_TRACE_DIR}}/rank0.json.gz
+        echo "Pulled to {{.LOCAL_TRACE_DIR}}/"
+        ls -lh {{.LOCAL_TRACE_DIR}}/*.json.gz
+
+  traces:summary:
+    desc: "Build summary.json.gz from frontend + GPU traces (LOCAL_TRACE_DIR= to override)"
+    cmds:
+      - |
+        {{.PYTHON}} tools/summary_trace.py \
+          {{.LOCAL_TRACE_DIR}}/frontend.json.gz \
+          {{.LOCAL_TRACE_DIR}}/rank0.json.gz \
+          {{.LOCAL_TRACE_DIR}}/summary.json.gz
+
   traces:ls:
     desc: List trace files in TRACE_DIR, split by frontend vs GPU worker
     cmds:
@@ -142,6 +172,137 @@ tasks:
     cmds:
       - rm -f {{.TRACE_DIR}}/*.json.gz {{.TRACE_DIR}}/*.json
       - echo "Cleaned {{.TRACE_DIR}}"
+
+  # ── Experiments ───────────────────────────────────────────────────────
+  # Each experiment restarts the server to ensure a cold cache, then captures
+  # one profiled request and saves traces to traces/expN/.
+  #
+  # Experiments:
+  #   1. small image  — URL
+  #   2. hi-res image — URL
+  #   3. small image  — base64
+  #   4. hi-res image — base64
+
+  _exp:restart-server:
+    internal: true
+    desc: Kill + restart vllm in pod with profiling, wait until ready
+    vars:
+      POD: '{{.POD | default "vllm-dev"}}'
+    cmds:
+      - |
+        oc exec {{.POD}} -- bash -c "
+          kill \$(pgrep -f 'vllm serve') 2>/dev/null || true; sleep 3
+          rm -f {{.TRACE_DIR}}/*.json.gz {{.TRACE_DIR}}/*.txt
+          nohup env VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 \
+            HF_TOKEN='$HF_TOKEN' HUGGING_FACE_HUB_TOKEN='$HF_TOKEN' \
+            /workspace/vllm/.venv/bin/vllm serve {{.MODEL}} \
+            --port {{.PORT}} \
+            --profiler-config '{\"profiler\":\"torch\",\"torch_profiler_dir\":\"{{.TRACE_DIR}}\",\"torch_profiler_with_stack\":{{.WITH_STACK}},\"max_iterations\":1}' \
+            > /tmp/vllm-serve.log 2>&1 &
+          echo \"Server PID \$!\"
+          until curl -sf http://localhost:{{.PORT}}/v1/models > /dev/null 2>&1; do
+            sleep 5
+          done
+          echo ready"
+
+  _exp:capture:
+    internal: true
+    desc: "Profile one URL-based request. Vars: IMAGE_URL, OUTDIR"
+    vars:
+      POD: '{{.POD | default "vllm-dev"}}'
+    cmds:
+      - |
+        oc exec {{.POD}} -- bash -c "
+          curl -fsS -X POST http://localhost:{{.PORT}}/start_profile
+          curl -sf http://localhost:{{.PORT}}/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{\"model\":\"{{.MODEL}}\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"{{.IMAGE_URL}}\"}},{\"type\":\"text\",\"text\":\"Describe this image in one sentence.\"}]}],\"max_tokens\":64}' \
+            > /dev/null
+          curl -fsS -X POST http://localhost:{{.PORT}}/stop_profile"
+      - task: traces:pull
+        vars: { LOCAL_TRACE_DIR: "{{.OUTDIR}}" }
+      - task: traces:summary
+        vars: { LOCAL_TRACE_DIR: "{{.OUTDIR}}" }
+
+  _exp:capture-base64:
+    internal: true
+    # Download and encode the image on the pod so the payload never crosses the
+    # local→pod boundary. Large hi-res images (several MB base64) would exceed
+    # shell ARG_MAX if constructed locally and passed via oc exec bash -c "...".
+    desc: "Profile one base64 request. Vars: IMAGE_URL, OUTDIR"
+    vars:
+      POD: '{{.POD | default "vllm-dev"}}'
+    cmds:
+      - |
+        oc exec -i {{.POD}} -- python3 - <<'PYEOF'
+import base64, json, urllib.request as R
+
+base  = "http://localhost:{{.PORT}}"
+url   = "{{.IMAGE_URL}}"
+model = "{{.MODEL}}"
+
+b64  = base64.b64encode(R.urlopen(url).read()).decode()
+body = json.dumps({
+    "model": model,
+    "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
+        {"type": "text", "text": "Describe this image in one sentence."},
+    ]}],
+    "max_tokens": 64,
+}).encode()
+
+R.urlopen(R.Request(f"{base}/start_profile", method="POST"))
+R.urlopen(R.Request(f"{base}/v1/chat/completions", body, {"Content-Type": "application/json"}))
+R.urlopen(R.Request(f"{base}/stop_profile", method="POST"))
+PYEOF
+      - task: traces:pull
+        vars: { LOCAL_TRACE_DIR: "{{.OUTDIR}}" }
+      - task: traces:summary
+        vars: { LOCAL_TRACE_DIR: "{{.OUTDIR}}" }
+
+  exp:1:
+    desc: "Experiment 1 — small image, URL delivery"
+    cmds:
+      - task: _exp:restart-server
+      - task: _exp:capture
+        vars:
+          IMAGE_URL: "{{.IMAGE_URL}}"
+          OUTDIR: ./traces/exp1_small_url
+
+  exp:2:
+    desc: "Experiment 2 — hi-res image, URL delivery"
+    cmds:
+      - task: _exp:restart-server
+      - task: _exp:capture
+        vars:
+          IMAGE_URL: "{{.IMAGE_URL_HIRES}}"
+          OUTDIR: ./traces/exp2_hires_url
+
+  exp:3:
+    desc: "Experiment 3 — small image, base64 delivery"
+    cmds:
+      - task: _exp:restart-server
+      - task: _exp:capture-base64
+        vars:
+          IMAGE_URL: "{{.IMAGE_URL}}"
+          OUTDIR: ./traces/exp3_small_base64
+
+  exp:4:
+    desc: "Experiment 4 — hi-res image, base64 delivery"
+    cmds:
+      - task: _exp:restart-server
+      - task: _exp:capture-base64
+        vars:
+          IMAGE_URL: "{{.IMAGE_URL_HIRES}}"
+          OUTDIR: ./traces/exp4_hires_base64
+
+  exp:all:
+    desc: "Run all 4 experiments sequentially (server restart between each)"
+    cmds:
+      - task: exp:1
+      - task: exp:2
+      - task: exp:3
+      - task: exp:4
 
   # ── Logs ──────────────────────────────────────────────────────────────
 
