@@ -1,0 +1,156 @@
+# https://taskfile.dev
+version: '3'
+
+vars:
+  MODEL: '{{.MODEL | default "llava-hf/llava-1.5-7b-hf"}}'
+  PORT: '{{.PORT | default "8000"}}'
+  TRACE_DIR: '{{.TRACE_DIR | default "/tmp/vllm-traces"}}'
+  PYTHON: .venv/bin/python
+  LOG_FILE: /tmp/vllm-server.log
+  # Stable public image used for ad-hoc profiling requests
+  IMAGE_URL: '{{.IMAGE_URL | default "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"}}'
+
+tasks:
+  default:
+    desc: List all tasks
+    cmds:
+      - task --list
+    silent: true
+
+  # ── Server ────────────────────────────────────────────────────────────
+
+  serve:
+    desc: "Start vLLM with torch profiler + custom record_function scopes. Logs tee → {{.LOG_FILE}}"
+    cmds:
+      - mkdir -p {{.TRACE_DIR}}
+      - |
+        VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 \
+        .venv/bin/vllm serve {{.MODEL}} \
+          --port {{.PORT}} \
+          --profiler-config '{"profiler":"torch","torch_profiler_dir":"{{.TRACE_DIR}}"}' \
+          2>&1 | tee {{.LOG_FILE}}
+
+  serve:plain:
+    desc: Start vLLM without profiler (baseline / smoke test)
+    cmds:
+      - .venv/bin/vllm serve {{.MODEL}} --port {{.PORT}} 2>&1 | tee {{.LOG_FILE}}
+
+  # ── Profiler control ──────────────────────────────────────────────────
+
+  profile:start:
+    desc: POST /start_profile — open a trace window
+    cmds:
+      - curl -fsS -X POST http://localhost:{{.PORT}}/start_profile && echo " profiler started"
+
+  profile:stop:
+    desc: POST /stop_profile — flush trace files to {{.TRACE_DIR}}
+    cmds:
+      - curl -fsS -X POST http://localhost:{{.PORT}}/stop_profile && echo " profiler stopped"
+
+  profile:request:
+    desc: "Send one VLM chat request with an image URL (IMAGE_URL= to override)"
+    cmds:
+      - |
+        curl -s http://localhost:{{.PORT}}/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "{{.MODEL}}",
+            "messages": [{
+              "role": "user",
+              "content": [
+                {"type": "image_url", "image_url": {"url": "{{.IMAGE_URL}}"}},
+                {"type": "text", "text": "Describe this image in one sentence."}
+              ]
+            }],
+            "max_tokens": 64
+          }' | {{.PYTHON}} -m json.tool
+
+  profile:run:
+    desc: "One-shot profiling: start → one VLM request → stop (captures one request end-to-end)"
+    cmds:
+      - task: profile:start
+      - task: profile:request
+      - task: profile:stop
+      - task: traces:ls
+
+  # ── Stress test ───────────────────────────────────────────────────────
+
+  stress:
+    desc: "Stress test the render endpoint. Override: N=50 C=8 task stress"
+    vars:
+      N: '{{.N | default "20"}}'
+      C: '{{.C | default "4"}}'
+    cmds:
+      - |
+        {{.PYTHON}} stress_test_render.py \
+          --url http://localhost:{{.PORT}} \
+          --n {{.N}} \
+          --concurrency {{.C}} \
+          --mode chat
+
+  # ── Traces ────────────────────────────────────────────────────────────
+
+  traces:ls:
+    desc: List trace files in TRACE_DIR, split by frontend vs GPU worker
+    cmds:
+      - |
+        echo "=== Traces in {{.TRACE_DIR}} ==="
+        echo ""
+        echo "Frontend (event-loop: url_download, mm_processor, prefill/decode labels):"
+        ls -lht {{.TRACE_DIR}}/async_llm.*.json.gz 2>/dev/null || echo "  (none)"
+        echo ""
+        echo "GPU worker (mm_encoder:forward, execute_model, CUDA kernels):"
+        ls -lht {{.TRACE_DIR}}/rank*.*.json.gz 2>/dev/null || echo "  (none)"
+    silent: true
+
+  traces:open:
+    desc: Open Perfetto UI and print the latest frontend + GPU trace paths to upload
+    cmds:
+      - open https://ui.perfetto.dev
+      - |
+        echo ""
+        echo "Drag & drop both files into Perfetto (or File → Open Trace File):"
+        echo ""
+        printf "  Frontend : "
+        ls -t {{.TRACE_DIR}}/async_llm.*.json.gz 2>/dev/null | head -1 || echo "(none)"
+        printf "  GPU      : "
+        ls -t {{.TRACE_DIR}}/rank0.*.json.gz 2>/dev/null | head -1 || echo "(none)"
+        echo ""
+        echo "Both traces share wall-clock time and will align on the same timeline."
+    silent: true
+
+  traces:unzip:
+    desc: Decompress all .gz traces (needed by tools that require raw JSON)
+    cmds:
+      - |
+        found=0
+        for f in {{.TRACE_DIR}}/*.json.gz; do
+          [ -f "$f" ] || continue
+          found=1
+          out="${f%.gz}"
+          if [ ! -f "$out" ]; then
+            gunzip -k "$f" && echo "Decompressed: $out"
+          else
+            echo "Already exists: $out"
+          fi
+        done
+        [ "$found" -eq 0 ] && echo "No .gz traces found in {{.TRACE_DIR}}"
+
+  traces:clean:
+    desc: Remove all traces from TRACE_DIR
+    prompt: "Delete all traces in {{.TRACE_DIR}}?"
+    cmds:
+      - rm -f {{.TRACE_DIR}}/*.json.gz {{.TRACE_DIR}}/*.json
+      - echo "Cleaned {{.TRACE_DIR}}"
+
+  # ── Logs ──────────────────────────────────────────────────────────────
+
+  logs:
+    desc: "Tail the server log (task serve tees output to {{.LOG_FILE}})"
+    cmds:
+      - tail -f {{.LOG_FILE}}
+
+  logs:grep:
+    desc: "Search server log for keyword: PATTERN=mm_processor task logs:grep"
+    cmds:
+      - grep -i "{{.PATTERN}}" {{.LOG_FILE}} | tail -100
