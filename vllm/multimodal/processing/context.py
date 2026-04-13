@@ -24,7 +24,6 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.func_utils import get_allowed_kwarg_only_overrides
 from vllm.utils.jsontree import JSONTree, json_map_leaves
 from vllm.utils.mistral import is_mistral_tokenizer
-from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from transformers.configuration_utils import PretrainedConfig
@@ -61,18 +60,17 @@ class TimingContext:
     @contextmanager
     def record(self, stage: str):
         """Record the execution time for a processing stage."""
-        with record_function_or_nullcontext(f"mm_processor: {stage}"):
-            if not self.enabled:
-                yield
-                return
+        if not self.enabled:
+            yield
+            return
 
-            start_time = time.perf_counter()
-            try:
-                yield
-            finally:
-                elapsed = time.perf_counter() - start_time
-                self.stage_secs.setdefault(stage, 0.0)
-                self.stage_secs[stage] += elapsed
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - start_time
+            self.stage_secs.setdefault(stage, 0.0)
+            self.stage_secs[stage] += elapsed
 
     def get_stats_dict(self):
         stats_dict = {
