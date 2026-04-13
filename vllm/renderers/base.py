@@ -46,6 +46,7 @@ from vllm.utils.async_utils import (
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
+from vllm.v1.utils import record_function_or_nullcontext
 
 from .embed_utils import safe_load_prompt_embeds
 from .inputs import (
@@ -741,14 +742,15 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
-            engine_input = await self._process_multimodal_async(
-                prompt_token_ids,
-                multi_modal_data,
-                mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
-                tokenization_kwargs=None,
-                mm_uuids=prompt.get("multi_modal_uuids"),
-                skip_mm_cache=skip_mm_cache,
-            )
+            with record_function_or_nullcontext("mm_processor: process_multimodal"):
+                engine_input = await self._process_multimodal_async(
+                    prompt_token_ids,
+                    multi_modal_data,
+                    mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
+                    tokenization_kwargs=None,
+                    mm_uuids=prompt.get("multi_modal_uuids"),
+                    skip_mm_cache=skip_mm_cache,
+                )
         else:
             engine_input = tokens_input(prompt_token_ids)
 
