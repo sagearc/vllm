@@ -36,7 +36,7 @@ impl MultimodalModelInfo {
         &self,
         clips: Vec<Arc<VideoClip>>,
         uuids: Vec<Option<String>>,
-        model_dtype: ModelDtype,
+        model_dtype: Option<ModelDtype>,
     ) -> Result<PreparedMedia> {
         let support = self.video.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Video.to_string(),
@@ -121,8 +121,16 @@ fn build_video_item(
     preprocessed: PreprocessedEncoderInputs,
     hash: String,
     uuid: Option<String>,
-    model_dtype: ModelDtype,
+    model_dtype: Option<ModelDtype>,
 ) -> Result<PreparedItem> {
+    let Some(model_dtype) = model_dtype else {
+        return Ok(PreparedItem {
+            data: None,
+            hash,
+            uuid,
+        });
+    };
+
     let tensors = tensor::collect_tensors(preprocessed, support.spec.primary_key(), model_dtype)?;
 
     let mut data = MmKwargsItem::new();
@@ -168,7 +176,11 @@ fn build_video_item(
         );
     }
 
-    Ok(PreparedItem { data, hash, uuid })
+    Ok(PreparedItem {
+        data: Some(data),
+        hash,
+        uuid,
+    })
 }
 
 #[cfg(test)]
@@ -285,16 +297,28 @@ mod tests {
             ]),
         };
 
+        let render_item = build_video_item(
+            info.video.as_ref().unwrap(),
+            preprocessed.clone(),
+            "<hash>".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(render_item.data.is_none());
+        assert_eq!(render_item.hash, "<hash>");
+
         let item = build_video_item(
             info.video.as_ref().unwrap(),
             preprocessed,
             "<hash>".to_string(),
             None,
-            ModelDtype::Float32,
+            Some(ModelDtype::Float32),
         )
         .unwrap();
 
-        let primary = &item.data[VIDEO_PRIMARY_KEY];
+        let data = item.data.as_ref().unwrap();
+        let primary = &data[VIDEO_PRIMARY_KEY];
         assert!(matches!(
             &primary.field,
             MmField::Flat(MmFlatField { slices, dim: 0, .. })
@@ -305,7 +329,7 @@ mod tests {
         ));
 
         // Batched metadata drops its singleton batch axis per item.
-        let grid = &item.data["video_grid_thw"];
+        let grid = &data["video_grid_thw"];
         assert!(matches!(&grid.field, MmField::Batched(_)));
         let MmKwargValue::Tensor(grid_tensor) = grid.data.as_ref().unwrap() else {
             panic!("expected tensor value for video_grid_thw");

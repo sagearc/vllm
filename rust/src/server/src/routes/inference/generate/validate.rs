@@ -30,6 +30,13 @@ pub(crate) fn validate_request_compat(
         );
     }
 
+    if request.content_parts.is_some() && request.mm_features.is_some() {
+        bail_invalid_request!(
+            param = "content_parts",
+            "content_parts and mm_features are mutually exclusive."
+        );
+    }
+
     if request.sampling_params.max_tokens == Some(0) {
         bail_invalid_request!(
             param = "sampling_params",
@@ -104,6 +111,19 @@ mod tests {
             token_ids: Vec::new(),
             ..base_request()
         };
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_both_multimodal_inputs() {
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "sampling_params": {},
+            "content_parts": [],
+            "mm_features": []
+        }))
+        .expect("parse request");
         assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
     }
 

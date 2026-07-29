@@ -14,6 +14,27 @@ use vllm_engine_core_client::protocol::multimodal::{
 use super::{PreparedItem, ResolvedMultimodalSpec, tensor};
 use crate::error::{Result, bail_multimodal, multimodal};
 
+pub(super) fn build_items_without_data(
+    hashes: Vec<String>,
+    uuids: Vec<Option<String>>,
+) -> Result<Vec<PreparedItem>> {
+    if uuids.len() != hashes.len() {
+        bail_multimodal!(
+            "number of media UUIDs {} does not match number of media items {}",
+            uuids.len(),
+            hashes.len()
+        );
+    }
+
+    Ok(izip!(hashes, uuids)
+        .map(|(hash, uuid)| PreparedItem {
+            data: None,
+            hash,
+            uuid,
+        })
+        .collect())
+}
+
 /// Split one batch of preprocessed tensors into engine kwargs per media item.
 pub(super) fn build_batched_items(
     spec: &ResolvedMultimodalSpec,
@@ -77,7 +98,11 @@ pub(super) fn build_batched_items(
             );
         }
 
-        items.push(PreparedItem { data, hash, uuid });
+        items.push(PreparedItem {
+            data: Some(data),
+            hash,
+            uuid,
+        });
     }
 
     Ok(items)

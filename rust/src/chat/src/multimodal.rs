@@ -9,7 +9,7 @@
 //! and builds the engine-facing `MmFeatures` payload.
 //!
 //! Raw media stays above `vllm-text`; this module lowers it into token IDs and
-//! opaque tensor payloads before the request is handed to text generation.
+//! multimodal metadata, with tensor payloads included for inference.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -335,9 +335,9 @@ struct PreparedMedia {
     items: Vec<PreparedItem>,
 }
 
-/// One media item's complete engine kwargs plus identity metadata.
+/// One media item's optional engine kwargs plus identity metadata.
 struct PreparedItem {
-    data: MmKwargsItem,
+    data: Option<MmKwargsItem>,
     hash: String,
     uuid: Option<String>,
 }
@@ -552,12 +552,13 @@ impl MultimodalModelInfo {
 ///
 /// Text-only requests pass through unchanged as `Prompt::Text`. Multimodal
 /// requests are tokenized in chat, their media placeholders are expanded, and
-/// preprocessed media features are attached for engine-core transport.
+/// preprocessed media features are attached for engine-core transport when
+/// requested by the caller.
 pub(crate) async fn finalize_rendered_prompt(
     request: &ChatRequest,
     rendered: RenderedPrompt,
     info: Option<&MultimodalModelInfo>,
-    model_dtype: ModelDtype,
+    model_dtype: Option<ModelDtype>,
 ) -> Result<(Prompt, Option<MmFeatures>)> {
     if !request.has_multimodal() {
         return Ok((rendered.prompt, None));
@@ -700,7 +701,7 @@ impl MultimodalModelInfo {
         &self,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,
-        model_dtype: ModelDtype,
+        model_dtype: Option<ModelDtype>,
     ) -> Result<MmFeatures> {
         let media_parts_len = media_parts.len();
         if media_parts_len == 0 {
@@ -719,7 +720,8 @@ impl MultimodalModelInfo {
                 .push(self.prepare_videos(fetched.videos, fetched.video_uuids, model_dtype).await?);
         }
         if !fetched.audios.is_empty() {
-            prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
+            prepared
+                .push(self.prepare_audios(fetched.audios, fetched.audio_uuids, model_dtype).await?);
         }
 
         let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
@@ -737,7 +739,7 @@ impl MultimodalModelInfo {
             }
             for (item, range) in izip!(media.items, media_ranges) {
                 features.push(MmFeatureSpec {
-                    data: Some(item.data),
+                    data: item.data,
                     modality: media.modality.to_string(),
                     identifier: item.uuid.unwrap_or_else(|| item.hash.clone()),
                     mm_position: range,

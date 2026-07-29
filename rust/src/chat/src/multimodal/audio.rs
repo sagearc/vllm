@@ -20,6 +20,7 @@ impl MultimodalModelInfo {
         &self,
         clips: Vec<Arc<AudioClip>>,
         uuids: Vec<Option<String>>,
+        model_dtype: Option<ModelDtype>,
     ) -> Result<PreparedMedia> {
         let support = self.audio.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Audio.to_string(),
@@ -35,13 +36,17 @@ impl MultimodalModelInfo {
         }
 
         let hashes = clips.iter().map(|clip| clip.hash.clone()).collect();
-        let items = item::build_batched_items(
-            &support.spec,
-            preprocessed,
-            hashes,
-            uuids,
-            ModelDtype::Float32,
-        )?;
+        let items = if model_dtype.is_some() {
+            item::build_batched_items(
+                &support.spec,
+                preprocessed,
+                hashes,
+                uuids,
+                ModelDtype::Float32,
+            )?
+        } else {
+            item::build_items_without_data(hashes, uuids)?
+        };
 
         Ok(PreparedMedia {
             modality: Modality::Audio,
@@ -230,8 +235,9 @@ mod tests {
         .pop()
         .unwrap();
 
+        let data = item.data.as_ref().unwrap();
         assert!(matches!(
-            &item.data[AUDIO_PRIMARY_KEY].field,
+            &data[AUDIO_PRIMARY_KEY].field,
             MmField::Batched(_)
         ));
     }
@@ -250,8 +256,25 @@ mod tests {
             .await
             .unwrap();
 
-        let prepared = info.prepare_audios(fetched.audios, fetched.audio_uuids).await.unwrap();
+        let rendered = info
+            .prepare_audios(fetched.audios.clone(), fetched.audio_uuids.clone(), None)
+            .await
+            .unwrap();
+        let prepared = info
+            .prepare_audios(
+                fetched.audios,
+                fetched.audio_uuids,
+                Some(ModelDtype::Float32),
+            )
+            .await
+            .unwrap();
 
+        assert_eq!(
+            rendered.replacements[0].tokens,
+            prepared.replacements[0].tokens
+        );
+        assert!(rendered.items[0].data.is_none());
+        assert_eq!(rendered.items[0].hash, expected_hash);
         assert_eq!(prepared.replacements.len(), 1);
         assert!(
             prepared.replacements[0]
@@ -263,14 +286,15 @@ mod tests {
         assert_eq!(item.hash, expected_hash);
         assert_eq!(item.uuid.as_deref(), Some("audio-1"));
 
-        let features = &item.data[AUDIO_PRIMARY_KEY];
+        let data = item.data.as_ref().unwrap();
+        let features = &data[AUDIO_PRIMARY_KEY];
         assert!(matches!(&features.field, MmField::Batched(_)));
         assert!(matches!(
             features.data.as_ref(),
             Some(MmKwargValue::Tensor(tensor))
                 if tensor.dtype == "float32" && tensor.shape.first() == Some(&128)
         ));
-        let lengths = &item.data["audio_feature_lengths"];
+        let lengths = &data["audio_feature_lengths"];
         assert!(matches!(&lengths.field, MmField::Batched(_)));
         assert!(matches!(
             lengths.data.as_ref(),
@@ -293,7 +317,14 @@ mod tests {
             .await
             .unwrap();
 
-        let prepared = info.prepare_audios(fetched.audios, fetched.audio_uuids).await.unwrap();
+        let prepared = info
+            .prepare_audios(
+                fetched.audios,
+                fetched.audio_uuids,
+                Some(ModelDtype::Float32),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(prepared.replacements.len(), 1);
         assert_eq!(
@@ -309,14 +340,15 @@ mod tests {
         assert_eq!(item.hash, expected_hash);
         assert_eq!(item.uuid.as_deref(), Some("audio-1"));
 
-        let features = &item.data[AUDIO_PRIMARY_KEY];
+        let data = item.data.as_ref().unwrap();
+        let features = &data[AUDIO_PRIMARY_KEY];
         assert!(matches!(&features.field, MmField::Flat(_)));
         assert!(matches!(
             features.data.as_ref(),
             Some(MmKwargValue::Tensor(tensor))
                 if tensor.dtype == "float32" && tensor.shape.get(1) == Some(&80)
         ));
-        let count = &item.data["num_audio_tokens"];
+        let count = &data["num_audio_tokens"];
         assert!(matches!(&count.field, MmField::Batched(_)));
         assert!(matches!(
             count.data.as_ref(),

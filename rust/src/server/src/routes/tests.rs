@@ -673,7 +673,9 @@ fn test_render_app_with_parser_selections(
     tool_call_parser: ParserSelection,
     reasoning_parser: ParserSelection,
 ) -> axum::Router {
-    let backend = Arc::new(FakeChatBackend::new());
+    let backend = Arc::new(FakeChatBackend::with_multimodal_model_info(
+        qwen_multimodal_model_info(),
+    ));
     build_render_router(Arc::new(RenderState {
         model: "backend-model".to_string(),
         served_model_names: vec!["render-model".to_string()],
@@ -1044,7 +1046,7 @@ fn metric_delta(
 }
 
 #[tokio::test]
-async fn render_chat_returns_generate_request_with_header_request_id() {
+async fn render_chat_returns_metadata_only_multimodal_request() {
     let mut app = test_render_app();
     let response = app
         .call(
@@ -1057,7 +1059,16 @@ async fn render_chat_returns_generate_request_with_header_request_id() {
                     json!({
                         "request_id": "body-req",
                         "model": "render-model",
-                        "messages": [{"role": "user", "content": "hello"}],
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                                },
+                                "uuid": "image-1"
+                            }]
+                        }],
                         "max_completion_tokens": 8,
                         "stream": true,
                         "stream_options": {"include_usage": true},
@@ -1082,9 +1093,17 @@ async fn render_chat_returns_generate_request_with_header_request_id() {
     assert_eq!(json["cache_salt"], "render-cache-salt");
     assert_eq!(json["priority"], -3);
     assert_eq!(json["sampling_params"]["max_tokens"], 8);
-    assert!(!json["token_ids"].as_array().unwrap().is_empty());
+    assert!(json["token_ids"].as_array().unwrap().len() > 1);
     assert!(json.get("prompt_token_ids").is_none());
-    assert!(json.get("mm_features").is_none());
+    let feature = &json["mm_features"][0];
+    assert!(feature["data"].is_null());
+    assert_eq!(feature["modality"], "image");
+    assert_eq!(feature["identifier"], "image-1");
+    assert_eq!(
+        feature["mm_hash"],
+        "62439026688e1c3693767c6bbe3763b232867f9f111f2f35e00f912b480ce149"
+    );
+    assert!(feature["mm_position"]["length"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]

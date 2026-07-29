@@ -94,8 +94,8 @@ pub fn validate_parser_overrides(
 /// Chat request preparation shared by inference and render-only frontends.
 pub struct ChatRequestProcessor {
     backend: DynChatBackend,
-    /// Effective model dtype reported by the engine.
-    /// Absent for text-only frontends without an engine handshake.
+    /// `Some(dtype)` attaches inference tensors; `None` omits them from the
+    /// rendered request.
     model_dtype: Option<ModelDtype>,
     /// Tool-call parser selection used when preparing generation requests.
     tool_call_parser: ParserSelection,
@@ -115,7 +115,7 @@ impl ChatRequestProcessor {
         }
     }
 
-    /// Create a render-only processor that rejects multimodal requests.
+    /// Create a render-only processor that omits multimodal tensor data.
     pub fn render_only(backend: DynChatBackend) -> Self {
         Self {
             backend,
@@ -141,19 +141,13 @@ impl ChatRequestProcessor {
         request: &ChatRequest,
         rendered: RenderedPrompt,
     ) -> Result<(Prompt, Option<MmFeatures>)> {
-        match self.model_dtype {
-            Some(model_dtype) => {
-                multimodal::finalize_rendered_prompt(
-                    request,
-                    rendered,
-                    self.backend.multimodal_model_info(),
-                    model_dtype,
-                )
-                .await
-            }
-            None if !request.has_multimodal() => Ok((rendered.prompt, None)),
-            None => Err(Error::UnsupportedMultimodalRenderer),
-        }
+        multimodal::finalize_rendered_prompt(
+            request,
+            rendered,
+            self.backend.multimodal_model_info(),
+            self.model_dtype,
+        )
+        .await
     }
 
     /// Prepare media for an already-tokenized request.
@@ -170,7 +164,7 @@ impl ChatRequestProcessor {
             .multimodal_model_info()
             .ok_or(Error::UnsupportedMultimodalRenderer)?;
         let model_dtype = self.model_dtype.ok_or(Error::UnsupportedMultimodalRenderer)?;
-        let features = info.prepare_multimodal(media, token_ids, model_dtype).await?;
+        let features = info.prepare_multimodal(media, token_ids, Some(model_dtype)).await?;
         Ok(Some(features))
     }
 

@@ -22,7 +22,7 @@ impl MultimodalModelInfo {
         &self,
         frames: Vec<Arc<ImageFrame>>,
         uuids: Vec<Option<String>>,
-        model_dtype: ModelDtype,
+        model_dtype: Option<ModelDtype>,
     ) -> Result<PreparedMedia> {
         let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Image.to_string(),
@@ -37,8 +37,12 @@ impl MultimodalModelInfo {
             );
         }
         let hashes = frames.iter().map(|frame| frame.hash.clone()).collect();
-        let items =
-            item::build_batched_items(&support.spec, preprocessed, hashes, uuids, model_dtype)?;
+        let items = match model_dtype {
+            Some(model_dtype) => {
+                item::build_batched_items(&support.spec, preprocessed, hashes, uuids, model_dtype)?
+            }
+            None => item::build_items_without_data(hashes, uuids)?,
+        };
 
         Ok(PreparedMedia {
             modality: Modality::Image,

@@ -80,6 +80,7 @@ fn lower_render_request(
         .prepare(text_request)
         .map_err(|error| text_submit_error("failed to prepare render request", error))?;
     let token_ids = prepared.generate_request.prompt_token_ids;
+    let mm_features = prepared.generate_request.mm_features;
     let text_request = prepared.text_request;
 
     let request = GenerateRequest {
@@ -94,6 +95,7 @@ fn lower_render_request(
         kv_transfer_params: None,
         ec_transfer_params: None,
         content_parts: None,
+        mm_features,
         other: Default::default(),
     };
     validate_generate_request(&request, &state.served_model_names)?;
