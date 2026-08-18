@@ -6,8 +6,7 @@
 
 use std::sync::Arc;
 
-use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs};
-use ndarray::Array1;
+use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs, PromptReplacement};
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 
 use super::{ModalitySupport, MultimodalModelInfo, PreparedMedia, item};
@@ -57,22 +56,28 @@ impl MultimodalModelInfo {
         let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Image.to_string(),
         })?;
-        let item_sizes = frames
+        if !matches!(support.spec.raw.name(), "qwen_vl" | "qwen3_vl") {
+            bail_multimodal!(
+                "render-only image metadata is not supported for {}",
+                support.spec.raw.name()
+            );
+        }
+        let replacements = frames
             .iter()
-            .map(|frame| (frame.data().width(), frame.data().height()))
-            .collect::<Vec<_>>();
-        let feature_token_counts = item_sizes
-            .iter()
-            .map(|&(width, height)| {
-                support.processor.calculate_num_tokens(width, height, &support.config)
+            .map(|frame| {
+                let count = support.processor.calculate_num_tokens(
+                    frame.data().width(),
+                    frame.data().height(),
+                    &support.config,
+                );
+                PromptReplacement::repeated(
+                    Modality::Image,
+                    &support.placeholder.token,
+                    support.placeholder.embed_token_id as i32,
+                    count,
+                )
             })
-            .collect();
-        let metadata = PreprocessedEncoderInputs::new(
-            Array1::<f32>::zeros(0),
-            feature_token_counts,
-            item_sizes,
-        );
-        let replacements = support.spec.prompt_replacements_for(&self.context, &metadata)?;
+            .collect::<Vec<_>>();
         if replacements.len() != frames.len() {
             bail_multimodal!(
                 "number of image prompt replacements {} does not match number of images {}",
