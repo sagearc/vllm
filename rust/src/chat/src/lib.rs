@@ -147,7 +147,7 @@ impl ChatRequestProcessor {
     ) -> Result<(Prompt, Option<MmFeatures>)> {
         match self.multimodal_preparation {
             MultimodalPreparation::Inference(model_dtype) => {
-                multimodal::finalize_inference_prompt(
+                multimodal::finalize_rendered_prompt(
                     request,
                     rendered,
                     self.backend.multimodal_model_info(),

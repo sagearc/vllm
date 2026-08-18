@@ -548,7 +548,9 @@ impl MultimodalModelInfo {
     }
 }
 
-pub(crate) async fn finalize_inference_prompt(
+/// Finalize a rendered chat prompt into inference input, including multimodal
+/// encoder tensors.
+pub(crate) async fn finalize_rendered_prompt(
     request: &ChatRequest,
     rendered: RenderedPrompt,
     info: Option<&MultimodalModelInfo>,
@@ -558,7 +560,8 @@ pub(crate) async fn finalize_inference_prompt(
         return Ok((rendered.prompt, None));
     }
     let info = info.ok_or(Error::UnsupportedMultimodalRenderer)?;
-    let (mut prompt_token_ids, media_parts) = tokenize_multimodal_prompt(request, rendered, info)?;
+    let (mut prompt_token_ids, media_parts) =
+        tokenize_prompt_and_extract_media(request, rendered, info)?;
     let prepared = info.prepare_multimodal(media_parts, &mut prompt_token_ids, model_dtype).await?;
 
     Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
@@ -573,13 +576,14 @@ pub(crate) async fn finalize_render_prompt(
         return Ok((rendered.prompt, None));
     }
     let info = info.ok_or(Error::UnsupportedMultimodalRenderer)?;
-    let (mut prompt_token_ids, media_parts) = tokenize_multimodal_prompt(request, rendered, info)?;
-    let prepared = info.prepare_multimodal_metadata(media_parts, &mut prompt_token_ids).await?;
+    let (mut prompt_token_ids, media_parts) =
+        tokenize_prompt_and_extract_media(request, rendered, info)?;
+    let prepared = info.prepare_multimodal_for_render(media_parts, &mut prompt_token_ids).await?;
 
     Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
 }
 
-fn tokenize_multimodal_prompt(
+fn tokenize_prompt_and_extract_media(
     request: &ChatRequest,
     rendered: RenderedPrompt,
     info: &MultimodalModelInfo,
@@ -708,6 +712,8 @@ impl MultimodalModelInfo {
         Ok(())
     }
 
+    /// Fetch and preprocess media, expand prompt placeholders, and build
+    /// inference features containing encoder tensors.
     pub(crate) async fn prepare_multimodal(
         &self,
         media_parts: Vec<MediaContentPart>,
@@ -734,10 +740,12 @@ impl MultimodalModelInfo {
             prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
         }
 
-        self.finish_multimodal(media_parts_len, prepared, prompt_token_ids)
+        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids)
     }
 
-    pub(crate) async fn prepare_multimodal_metadata(
+    /// Fetch image metadata, expand prompt placeholders, and build render-only
+    /// features without encoder tensors.
+    pub(crate) async fn prepare_multimodal_for_render(
         &self,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,
@@ -754,13 +762,14 @@ impl MultimodalModelInfo {
 
         let mut prepared = Vec::new();
         if !fetched.images.is_empty() {
-            prepared.push(self.prepare_image_metadata(fetched.images, fetched.image_uuids)?);
+            prepared.push(self.prepare_image_for_render(fetched.images, fetched.image_uuids)?);
         }
 
-        self.finish_multimodal(media_parts_len, prepared, prompt_token_ids)
+        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids)
     }
 
-    fn finish_multimodal(
+    /// Expand media markers and assemble engine-compatible feature metadata.
+    fn build_multimodal_features(
         &self,
         media_parts_len: usize,
         prepared: Vec<PreparedMedia>,

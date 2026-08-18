@@ -6,10 +6,11 @@
 
 use std::sync::Arc;
 
+use itertools::izip;
 use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs, PromptReplacement};
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 
-use super::{ModalitySupport, MultimodalModelInfo, PreparedMedia, item};
+use super::{ModalitySupport, MultimodalModelInfo, PreparedItem, PreparedMedia, item};
 use crate::error::{Error, Result, bail_multimodal, multimodal};
 
 /// Forward-kwargs name of the primary image encoder input.
@@ -48,7 +49,7 @@ impl MultimodalModelInfo {
         })
     }
 
-    pub(super) fn prepare_image_metadata(
+    pub(super) fn prepare_image_for_render(
         &self,
         frames: Vec<Arc<ImageFrame>>,
         uuids: Vec<Option<String>>,
@@ -62,31 +63,34 @@ impl MultimodalModelInfo {
                 support.spec.raw.name()
             );
         }
-        let replacements = frames
-            .iter()
-            .map(|frame| {
-                let count = support.processor.calculate_num_tokens(
-                    frame.data().width(),
-                    frame.data().height(),
-                    &support.config,
-                );
-                PromptReplacement::repeated(
-                    Modality::Image,
-                    &support.placeholder.token,
-                    support.placeholder.embed_token_id as i32,
-                    count,
-                )
-            })
-            .collect::<Vec<_>>();
-        if replacements.len() != frames.len() {
+        if uuids.len() != frames.len() {
             bail_multimodal!(
-                "number of image prompt replacements {} does not match number of images {}",
-                replacements.len(),
+                "number of media UUIDs {} does not match number of media items {}",
+                uuids.len(),
                 frames.len()
             );
         }
-        let hashes = frames.iter().map(|frame| frame.hash.clone()).collect();
-        let items = item::build_items_without_data(hashes, uuids)?;
+
+        let mut replacements = Vec::with_capacity(frames.len());
+        let mut items = Vec::with_capacity(frames.len());
+        for (frame, uuid) in izip!(frames, uuids) {
+            let count = support.processor.calculate_num_tokens(
+                frame.data().width(),
+                frame.data().height(),
+                &support.config,
+            );
+            replacements.push(PromptReplacement::repeated(
+                Modality::Image,
+                &support.placeholder.token,
+                support.placeholder.embed_token_id as i32,
+                count,
+            ));
+            items.push(PreparedItem {
+                data: None,
+                hash: frame.hash.clone(),
+                uuid,
+            });
+        }
 
         Ok(PreparedMedia {
             modality: Modality::Image,
@@ -181,7 +185,7 @@ mod tests {
         info.image.as_mut().unwrap().processor = &METADATA_ONLY_PROCESSOR;
         let fetched = fetched_image(&info).await;
 
-        let prepared = info.prepare_image_metadata(fetched.images, fetched.image_uuids).unwrap();
+        let prepared = info.prepare_image_for_render(fetched.images, fetched.image_uuids).unwrap();
 
         assert_eq!(prepared.replacements[0].tokens.len(), 4);
         assert!(prepared.items[0].data.is_none());
@@ -193,7 +197,7 @@ mod tests {
         let info = qwen3_vl_info();
         let fetched = fetched_image(&info).await;
         let rendered = info
-            .prepare_image_metadata(fetched.images.clone(), fetched.image_uuids.clone())
+            .prepare_image_for_render(fetched.images.clone(), fetched.image_uuids.clone())
             .unwrap();
         let inferred = info
             .prepare_images(fetched.images, fetched.image_uuids, ModelDtype::Float32)
