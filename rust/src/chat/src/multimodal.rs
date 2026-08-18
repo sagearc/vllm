@@ -548,23 +548,43 @@ impl MultimodalModelInfo {
     }
 }
 
-/// Finalize a rendered chat prompt into text-generation input.
-///
-/// Text-only requests pass through unchanged as `Prompt::Text`. Multimodal
-/// requests are tokenized in chat, their media placeholders are expanded, and
-/// preprocessed media features are attached for engine-core transport when
-/// requested by the caller.
-pub(crate) async fn finalize_rendered_prompt(
+pub(crate) async fn finalize_inference_prompt(
     request: &ChatRequest,
     rendered: RenderedPrompt,
     info: Option<&MultimodalModelInfo>,
-    model_dtype: Option<ModelDtype>,
+    model_dtype: ModelDtype,
 ) -> Result<(Prompt, Option<MmFeatures>)> {
     if !request.has_multimodal() {
         return Ok((rendered.prompt, None));
     }
     let info = info.ok_or(Error::UnsupportedMultimodalRenderer)?;
-    let mut prompt_token_ids = match rendered.prompt {
+    let (mut prompt_token_ids, media_parts) = tokenize_multimodal_prompt(request, rendered, info)?;
+    let prepared = info.prepare_multimodal(media_parts, &mut prompt_token_ids, model_dtype).await?;
+
+    Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
+}
+
+pub(crate) async fn finalize_render_prompt(
+    request: &ChatRequest,
+    rendered: RenderedPrompt,
+    info: Option<&MultimodalModelInfo>,
+) -> Result<(Prompt, Option<MmFeatures>)> {
+    if !request.has_multimodal() {
+        return Ok((rendered.prompt, None));
+    }
+    let info = info.ok_or(Error::UnsupportedMultimodalRenderer)?;
+    let (mut prompt_token_ids, media_parts) = tokenize_multimodal_prompt(request, rendered, info)?;
+    let prepared = info.prepare_multimodal_metadata(media_parts, &mut prompt_token_ids).await?;
+
+    Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
+}
+
+fn tokenize_multimodal_prompt(
+    request: &ChatRequest,
+    rendered: RenderedPrompt,
+    info: &MultimodalModelInfo,
+) -> Result<(Vec<u32>, Vec<MediaContentPart>)> {
+    let prompt_token_ids = match rendered.prompt {
         Prompt::Text(prompt) => info
             .context
             .tokenizer()
@@ -572,10 +592,7 @@ pub(crate) async fn finalize_rendered_prompt(
             .map_err(|error| multimodal!("{error}"))?,
         Prompt::TokenIds(token_ids) => token_ids,
     };
-    let media_parts = extract_media_parts(request)?;
-    let prepared = info.prepare_multimodal(media_parts, &mut prompt_token_ids, model_dtype).await?;
-
-    Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
+    Ok((prompt_token_ids, extract_media_parts(request)?))
 }
 
 /// Extract media parts from chat messages in message/content order.
@@ -691,17 +708,11 @@ impl MultimodalModelInfo {
         Ok(())
     }
 
-    /// Run media fetch, per-modality preprocessing, prompt expansion, and
-    /// feature build.
-    ///
-    /// `prompt_token_ids` is mutated in place because placeholder expansion
-    /// changes both the final prompt and the offsets recorded in
-    /// `PlaceholderRange`.
     pub(crate) async fn prepare_multimodal(
         &self,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,
-        model_dtype: Option<ModelDtype>,
+        model_dtype: ModelDtype,
     ) -> Result<MmFeatures> {
         let media_parts_len = media_parts.len();
         if media_parts_len == 0 {
@@ -720,10 +731,41 @@ impl MultimodalModelInfo {
                 .push(self.prepare_videos(fetched.videos, fetched.video_uuids, model_dtype).await?);
         }
         if !fetched.audios.is_empty() {
-            prepared
-                .push(self.prepare_audios(fetched.audios, fetched.audio_uuids, model_dtype).await?);
+            prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
         }
 
+        self.finish_multimodal(media_parts_len, prepared, prompt_token_ids)
+    }
+
+    pub(crate) async fn prepare_multimodal_metadata(
+        &self,
+        media_parts: Vec<MediaContentPart>,
+        prompt_token_ids: &mut Vec<u32>,
+    ) -> Result<MmFeatures> {
+        let media_parts_len = media_parts.len();
+        if media_parts_len == 0 {
+            return Ok(Vec::new());
+        }
+        self.validate_mm_limits(&media_parts)?;
+        let fetched = self.fetch_media(media_parts).await?;
+        if !fetched.videos.is_empty() || !fetched.audios.is_empty() {
+            bail_multimodal!("render-only metadata currently supports image inputs only");
+        }
+
+        let mut prepared = Vec::new();
+        if !fetched.images.is_empty() {
+            prepared.push(self.prepare_image_metadata(fetched.images, fetched.image_uuids)?);
+        }
+
+        self.finish_multimodal(media_parts_len, prepared, prompt_token_ids)
+    }
+
+    fn finish_multimodal(
+        &self,
+        media_parts_len: usize,
+        prepared: Vec<PreparedMedia>,
+        prompt_token_ids: &mut Vec<u32>,
+    ) -> Result<MmFeatures> {
         let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
 
         let mut features = Vec::with_capacity(media_parts_len);

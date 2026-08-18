@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs};
+use ndarray::Array1;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 
 use super::{ModalitySupport, MultimodalModelInfo, PreparedMedia, item};
@@ -22,7 +23,7 @@ impl MultimodalModelInfo {
         &self,
         frames: Vec<Arc<ImageFrame>>,
         uuids: Vec<Option<String>>,
-        model_dtype: Option<ModelDtype>,
+        model_dtype: ModelDtype,
     ) -> Result<PreparedMedia> {
         let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Image.to_string(),
@@ -37,12 +38,50 @@ impl MultimodalModelInfo {
             );
         }
         let hashes = frames.iter().map(|frame| frame.hash.clone()).collect();
-        let items = match model_dtype {
-            Some(model_dtype) => {
-                item::build_batched_items(&support.spec, preprocessed, hashes, uuids, model_dtype)?
-            }
-            None => item::build_items_without_data(hashes, uuids)?,
-        };
+        let items =
+            item::build_batched_items(&support.spec, preprocessed, hashes, uuids, model_dtype)?;
+
+        Ok(PreparedMedia {
+            modality: Modality::Image,
+            placeholder: support.placeholder.clone(),
+            replacements,
+            items,
+        })
+    }
+
+    pub(super) fn prepare_image_metadata(
+        &self,
+        frames: Vec<Arc<ImageFrame>>,
+        uuids: Vec<Option<String>>,
+    ) -> Result<PreparedMedia> {
+        let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
+            modality: Modality::Image.to_string(),
+        })?;
+        let item_sizes = frames
+            .iter()
+            .map(|frame| (frame.data().width(), frame.data().height()))
+            .collect::<Vec<_>>();
+        let feature_token_counts = item_sizes
+            .iter()
+            .map(|&(width, height)| {
+                support.processor.calculate_num_tokens(width, height, &support.config)
+            })
+            .collect();
+        let metadata = PreprocessedEncoderInputs::new(
+            Array1::<f32>::zeros(0),
+            feature_token_counts,
+            item_sizes,
+        );
+        let replacements = support.spec.prompt_replacements_for(&self.context, &metadata)?;
+        if replacements.len() != frames.len() {
+            bail_multimodal!(
+                "number of image prompt replacements {} does not match number of images {}",
+                replacements.len(),
+                frames.len()
+            );
+        }
+        let hashes = frames.iter().map(|frame| frame.hash.clone()).collect();
+        let items = item::build_items_without_data(hashes, uuids)?;
 
         Ok(PreparedMedia {
             modality: Modality::Image,

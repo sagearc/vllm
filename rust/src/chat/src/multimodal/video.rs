@@ -36,7 +36,7 @@ impl MultimodalModelInfo {
         &self,
         clips: Vec<Arc<VideoClip>>,
         uuids: Vec<Option<String>>,
-        model_dtype: Option<ModelDtype>,
+        model_dtype: ModelDtype,
     ) -> Result<PreparedMedia> {
         let support = self.video.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Video.to_string(),
@@ -121,16 +121,8 @@ fn build_video_item(
     preprocessed: PreprocessedEncoderInputs,
     hash: String,
     uuid: Option<String>,
-    model_dtype: Option<ModelDtype>,
+    model_dtype: ModelDtype,
 ) -> Result<PreparedItem> {
-    let Some(model_dtype) = model_dtype else {
-        return Ok(PreparedItem {
-            data: None,
-            hash,
-            uuid,
-        });
-    };
-
     let tensors = tensor::collect_tensors(preprocessed, support.spec.primary_key(), model_dtype)?;
 
     let mut data = MmKwargsItem::new();
@@ -297,23 +289,12 @@ mod tests {
             ]),
         };
 
-        let render_item = build_video_item(
-            info.video.as_ref().unwrap(),
-            preprocessed.clone(),
-            "<hash>".to_string(),
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(render_item.data.is_none());
-        assert_eq!(render_item.hash, "<hash>");
-
         let item = build_video_item(
             info.video.as_ref().unwrap(),
             preprocessed,
             "<hash>".to_string(),
             None,
-            Some(ModelDtype::Float32),
+            ModelDtype::Float32,
         )
         .unwrap();
 

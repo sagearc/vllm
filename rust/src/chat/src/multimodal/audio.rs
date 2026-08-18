@@ -20,7 +20,6 @@ impl MultimodalModelInfo {
         &self,
         clips: Vec<Arc<AudioClip>>,
         uuids: Vec<Option<String>>,
-        model_dtype: Option<ModelDtype>,
     ) -> Result<PreparedMedia> {
         let support = self.audio.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Audio.to_string(),
@@ -36,17 +35,13 @@ impl MultimodalModelInfo {
         }
 
         let hashes = clips.iter().map(|clip| clip.hash.clone()).collect();
-        let items = if model_dtype.is_some() {
-            item::build_batched_items(
-                &support.spec,
-                preprocessed,
-                hashes,
-                uuids,
-                ModelDtype::Float32,
-            )?
-        } else {
-            item::build_items_without_data(hashes, uuids)?
-        };
+        let items = item::build_batched_items(
+            &support.spec,
+            preprocessed,
+            hashes,
+            uuids,
+            ModelDtype::Float32,
+        )?;
 
         Ok(PreparedMedia {
             modality: Modality::Audio,
@@ -256,25 +251,8 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = info
-            .prepare_audios(fetched.audios.clone(), fetched.audio_uuids.clone(), None)
-            .await
-            .unwrap();
-        let prepared = info
-            .prepare_audios(
-                fetched.audios,
-                fetched.audio_uuids,
-                Some(ModelDtype::Float32),
-            )
-            .await
-            .unwrap();
+        let prepared = info.prepare_audios(fetched.audios, fetched.audio_uuids).await.unwrap();
 
-        assert_eq!(
-            rendered.replacements[0].tokens,
-            prepared.replacements[0].tokens
-        );
-        assert!(rendered.items[0].data.is_none());
-        assert_eq!(rendered.items[0].hash, expected_hash);
         assert_eq!(prepared.replacements.len(), 1);
         assert!(
             prepared.replacements[0]
@@ -317,14 +295,7 @@ mod tests {
             .await
             .unwrap();
 
-        let prepared = info
-            .prepare_audios(
-                fetched.audios,
-                fetched.audio_uuids,
-                Some(ModelDtype::Float32),
-            )
-            .await
-            .unwrap();
+        let prepared = info.prepare_audios(fetched.audios, fetched.audio_uuids).await.unwrap();
 
         assert_eq!(prepared.replacements.len(), 1);
         assert_eq!(
