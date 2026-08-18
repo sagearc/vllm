@@ -62,7 +62,7 @@ pub async fn generate(
             }
         }
     } else {
-        body.mm_features.take()
+        None
     };
 
     let prepared =

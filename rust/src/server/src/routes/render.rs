@@ -9,7 +9,9 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
+use serde::Serialize;
 use thiserror_ext::AsReport as _;
+use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_text::TextRequest;
 
 use crate::DEFAULT_REQUEST_BODY_LIMIT_BYTES;
@@ -68,13 +70,21 @@ fn model_resolution(state: &RenderState) -> LoraModelResolution {
     }
 }
 
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Serialize)]
+struct RenderResponse {
+    #[serde(flatten)]
+    request: GenerateRequest,
+    mm_features: Option<MmFeatures>,
+}
+
 fn lower_render_request(
     state: &RenderState,
     text_request: TextRequest,
     model: String,
     stream: bool,
     stream_options: Option<StreamOptions>,
-) -> Result<GenerateRequest, ApiError> {
+) -> Result<RenderResponse, ApiError> {
     let prepared = state
         .text
         .prepare(text_request)
@@ -95,18 +105,20 @@ fn lower_render_request(
         kv_transfer_params: None,
         ec_transfer_params: None,
         content_parts: None,
-        mm_features,
         other: Default::default(),
     };
     validate_generate_request(&request, &state.served_model_names)?;
-    Ok(request)
+    Ok(RenderResponse {
+        request,
+        mm_features,
+    })
 }
 
 async fn render_chat(
     State(state): State<Arc<RenderState>>,
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
-) -> Result<Json<GenerateRequest>, ApiError> {
+) -> Result<Json<RenderResponse>, ApiError> {
     let model = body.model.clone();
     let stream = body.stream;
     let stream_options = body.stream_options.clone();
@@ -130,7 +142,7 @@ async fn render_completion(
     State(state): State<Arc<RenderState>>,
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
-) -> Result<Json<Vec<GenerateRequest>>, ApiError> {
+) -> Result<Json<Vec<RenderResponse>>, ApiError> {
     let model = body.model.clone();
     let stream = body.stream;
     let stream_options = body.stream_options.clone();

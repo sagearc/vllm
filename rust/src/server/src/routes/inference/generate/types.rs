@@ -7,7 +7,6 @@ use llm_multimodal::MediaContentPart;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
-use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_text::SamplingParams;
 
 use crate::routes::openai::utils::types::{ChatLogProbs, Normalizable, StreamOptions, Usage};
@@ -28,10 +27,8 @@ pub struct GenerateRequest {
     pub priority: i32,
     pub kv_transfer_params: Option<HashMap<String, Value>>,
     pub ec_transfer_params: Option<HashMap<String, Value>>,
-    /// Raw multimodal input; server resolves media. Mutually exclusive with `mm_features`.
+    /// Raw multimodal input; server resolves media. Mutually exclusive with `features`.
     pub content_parts: Option<Vec<MediaContentPart>>,
-    /// Preprocessed multimodal metadata and optional tensor data.
-    pub mm_features: Option<MmFeatures>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
