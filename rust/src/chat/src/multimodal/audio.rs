@@ -25,6 +25,9 @@ impl MultimodalModelInfo {
         let support = self.audio.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Audio.to_string(),
         })?;
+        if model_dtype.is_none() {
+            bail_multimodal!("model does not support metadata-only audio preprocessing");
+        }
         let preprocessed = self.preprocess_audios(support, &clips).await?;
         let replacements = support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
         if replacements.len() != clips.len() {
@@ -36,17 +39,13 @@ impl MultimodalModelInfo {
         }
 
         let hashes = clips.iter().map(|clip| clip.hash.clone()).collect();
-        let items = if model_dtype.is_some() {
-            item::build_batched_items(
-                &support.spec,
-                preprocessed,
-                hashes,
-                uuids,
-                ModelDtype::Float32,
-            )?
-        } else {
-            item::build_items_without_data(hashes, uuids)?
-        };
+        let items = item::build_batched_items(
+            &support.spec,
+            preprocessed,
+            hashes,
+            uuids,
+            ModelDtype::Float32,
+        )?;
 
         Ok(PreparedMedia {
             modality: Modality::Audio,
@@ -243,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_processor_and_lowering_preserve_audio_contract() {
+    async fn tracker_processor_and_lowering_preserve_audio_inference_contract() {
         let info = qwen3_asr_info();
         let wav = wav_i16_mono(16_000, &[0; 1_600]);
         let expected_hash = llm_multimodal::hasher::hash_audio(&wav);
@@ -256,10 +255,6 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = info
-            .prepare_audios(fetched.audios.clone(), fetched.audio_uuids.clone(), None)
-            .await
-            .unwrap();
         let prepared = info
             .prepare_audios(
                 fetched.audios,
@@ -269,12 +264,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            rendered.replacements[0].tokens,
-            prepared.replacements[0].tokens
-        );
-        assert!(rendered.items[0].data.is_none());
-        assert_eq!(rendered.items[0].hash, expected_hash);
         assert_eq!(prepared.replacements.len(), 1);
         assert!(
             prepared.replacements[0]
@@ -300,6 +289,31 @@ mod tests {
             lengths.data.as_ref(),
             Some(MmKwargValue::Tensor(tensor))
                 if tensor.dtype == "int64" && tensor.shape.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn render_only_audio_requires_metadata_preprocessing() {
+        let info = qwen3_asr_info();
+        let wav = wav_i16_mono(16_000, &[0; 1_600]);
+        let fetched = info
+            .fetch_media(vec![MediaContentPart::AudioData {
+                data: wav,
+                mime_type: Some("audio/wav".to_string()),
+                uuid: None,
+            }])
+            .await
+            .unwrap();
+
+        let error = match info.prepare_audios(fetched.audios, fetched.audio_uuids, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("render-only audio should require metadata preprocessing"),
+        };
+
+        assert!(matches!(
+            error,
+            Error::Multimodal(message)
+                if message.contains("does not support metadata-only audio preprocessing")
         ));
     }
 

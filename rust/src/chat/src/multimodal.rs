@@ -20,9 +20,9 @@ use itertools::izip;
 use llm_multimodal::{
     AsyncMultiModalTracker, AudioClip, AudioPreProcessor, EncoderFieldLayouts, FieldLayout,
     ImageFrame, MediaConnector, MediaConnectorConfig, MediaContentPart, Modality, ModelMetadata,
-    ModelProcessorSpec, ModelRegistry, PreProcessorConfig, PreprocessedEncoderInputs,
-    PromptReplacement, Tokenizer as TokenResolver, TrackedMedia, VideoClip, VisionPreProcessor,
-    VisionProcessorRegistry,
+    ModelProcessorSpec, ModelRegistry, MultiModalProcessorMetadata, PreProcessorConfig,
+    PreprocessedEncoderInputs, PromptReplacement, Tokenizer as TokenResolver, TrackedMedia,
+    VideoClip, VisionPreProcessor, VisionProcessorRegistry,
 };
 use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport as _;
@@ -211,6 +211,18 @@ impl ResolvedMultimodalSpec {
         Ok(self
             .raw
             .prompt_replacements_for(&context.metadata(), preprocessed, self.modality)?)
+    }
+
+    fn prompt_replacements_for_metadata(
+        &self,
+        context: &MultimodalModelContext,
+        preprocessed: &MultiModalProcessorMetadata,
+    ) -> Result<Vec<PromptReplacement>> {
+        Ok(self.raw.prompt_replacements_for_metadata(
+            &context.metadata(),
+            preprocessed,
+            self.modality,
+        )?)
     }
 }
 
@@ -552,8 +564,8 @@ impl MultimodalModelInfo {
 ///
 /// Text-only requests pass through unchanged as `Prompt::Text`. Multimodal
 /// requests are tokenized in chat, their media placeholders are expanded, and
-/// preprocessed media features are attached for engine-core transport when
-/// requested by the caller.
+/// media features are attached for engine-core transport. In render-only mode,
+/// supported processors calculate prompt metadata without encoder tensors.
 pub(crate) async fn finalize_rendered_prompt(
     request: &ChatRequest,
     rendered: RenderedPrompt,

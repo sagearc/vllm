@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use itertools::izip;
-use llm_multimodal::{FieldLayout, Modality, PreprocessedEncoderInputs, VideoClip};
+use llm_multimodal::{
+    FieldLayout, Modality, MultiModalProcessorMetadata, PreprocessedEncoderInputs, VideoClip,
+};
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
@@ -45,9 +47,34 @@ impl MultimodalModelInfo {
         let mut items = Vec::with_capacity(clips.len());
 
         for (clip, uuid) in izip!(&clips, uuids) {
-            let preprocessed = self.preprocess_video_clip(support, Arc::clone(clip)).await?;
-            let mut clip_replacements =
-                support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
+            let (mut clip_replacements, item) = match model_dtype {
+                Some(model_dtype) => {
+                    let preprocessed =
+                        self.preprocess_video_clip(support, Arc::clone(clip)).await?;
+                    let replacements =
+                        support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
+                    let item = build_video_item(
+                        support,
+                        preprocessed,
+                        clip.hash.clone(),
+                        uuid,
+                        model_dtype,
+                    )?;
+                    (replacements, item)
+                }
+                None => {
+                    let metadata =
+                        self.preprocess_video_clip_metadata(support, Arc::clone(clip)).await?;
+                    let replacements =
+                        support.spec.prompt_replacements_for_metadata(&self.context, &metadata)?;
+                    let item = PreparedItem {
+                        data: None,
+                        hash: clip.hash.clone(),
+                        uuid,
+                    };
+                    (replacements, item)
+                }
+            };
             if clip_replacements.len() != 1 {
                 bail_multimodal!(
                     "expected exactly one prompt replacement per video clip, got {}",
@@ -55,13 +82,7 @@ impl MultimodalModelInfo {
                 );
             }
             replacements.push(clip_replacements.pop().unwrap());
-            items.push(build_video_item(
-                support,
-                preprocessed,
-                clip.hash.clone(),
-                uuid,
-                model_dtype,
-            )?);
+            items.push(item);
         }
 
         Ok(PreparedMedia {
@@ -107,6 +128,48 @@ impl MultimodalModelInfo {
         .await
         .map_err(|error| multimodal!("video preprocessing task failed: {error}"))?
     }
+
+    /// Compute one clip's prompt metadata without constructing encoder tensors.
+    async fn preprocess_video_clip_metadata(
+        &self,
+        support: &ModalitySupport,
+        clip: Arc<VideoClip>,
+    ) -> Result<MultiModalProcessorMetadata> {
+        let config = support.config.clone();
+        let processor = support.processor;
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(rgb_video) = clip.rgb_video() {
+                match rgb_video.frame_refs() {
+                    Ok(frame_refs) => {
+                        match processor.preprocess_video_rgb_metadata(&frame_refs, &config) {
+                            Ok(Some(metadata)) => return Ok(metadata),
+                            Ok(None) => {}
+                            Err(error) => warn!(
+                                error = %error.as_report(),
+                                "RGB video metadata preprocessing failed; falling back to materialized frames"
+                            ),
+                        }
+                    }
+                    Err(error) => warn!(
+                        error,
+                        "RGB video frame refs are invalid; falling back to materialized frames"
+                    ),
+                }
+            }
+
+            let frames = clip
+                .materialized_frames()
+                .map_err(|error| multimodal!("{error}"))?;
+            processor
+                .preprocess_video_metadata(&frames, &config)?
+                .ok_or_else(|| {
+                    multimodal!("model does not support metadata-only video preprocessing")
+                })
+        })
+        .await
+        .map_err(|error| multimodal!("video metadata preprocessing task failed: {error}"))?
+    }
 }
 
 /// Convert one preprocessed video clip into engine kwargs.
@@ -121,16 +184,8 @@ fn build_video_item(
     preprocessed: PreprocessedEncoderInputs,
     hash: String,
     uuid: Option<String>,
-    model_dtype: Option<ModelDtype>,
+    model_dtype: ModelDtype,
 ) -> Result<PreparedItem> {
-    let Some(model_dtype) = model_dtype else {
-        return Ok(PreparedItem {
-            data: None,
-            hash,
-            uuid,
-        });
-    };
-
     let tensors = tensor::collect_tensors(preprocessed, support.spec.primary_key(), model_dtype)?;
 
     let mut data = MmKwargsItem::new();
@@ -297,23 +352,12 @@ mod tests {
             ]),
         };
 
-        let render_item = build_video_item(
-            info.video.as_ref().unwrap(),
-            preprocessed.clone(),
-            "<hash>".to_string(),
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(render_item.data.is_none());
-        assert_eq!(render_item.hash, "<hash>");
-
         let item = build_video_item(
             info.video.as_ref().unwrap(),
             preprocessed,
             "<hash>".to_string(),
             None,
-            Some(ModelDtype::Float32),
+            ModelDtype::Float32,
         )
         .unwrap();
 
