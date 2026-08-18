@@ -94,8 +94,8 @@ pub fn validate_parser_overrides(
 /// Chat request preparation shared by inference and render-only frontends.
 pub struct ChatRequestProcessor {
     backend: DynChatBackend,
-    /// `Some(dtype)` runs inference preprocessing; `None` runs the model's
-    /// metadata-only preprocessing path.
+    /// `Some(dtype)` attaches inference tensors; `None` omits them from the
+    /// rendered request.
     model_dtype: Option<ModelDtype>,
     /// Tool-call parser selection used when preparing generation requests.
     tool_call_parser: ParserSelection,
@@ -115,7 +115,7 @@ impl ChatRequestProcessor {
         }
     }
 
-    /// Create a render-only processor that avoids multimodal tensor construction.
+    /// Create a render-only processor that omits multimodal tensor data.
     pub fn render_only(backend: DynChatBackend) -> Self {
         Self {
             backend,

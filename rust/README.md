@@ -98,13 +98,11 @@ changing its fields.
 The render and inference paths use the same `vllm-chat` and `vllm-text`
 request-preparation logic; render mode stops before engine submission. For
 multimodal chat requests, `mm_features` contain raw-media hashes, identifiers,
-and expanded placeholder positions, but omit preprocessed tensor `data`.
-Qwen3-VL image and video processors calculate that metadata without
-constructing encoder tensors. Other multimodal processors are rejected in
-render mode until they provide the same metadata-only contract. The result is
-suitable for routing and cache lookup, and can be submitted to a downstream
-Rust `/inference/v1/generate` endpoint when its multimodal processor cache
-already contains the referenced media.
+and expanded placeholder positions, but omit preprocessed tensor `data`. Full
+multimodal preprocessing still runs to calculate the placeholder expansion.
+The result is suitable for routing and cache lookup, and can be submitted to a
+downstream Rust `/inference/v1/generate` endpoint when its multimodal processor
+cache already contains the referenced media.
 
 Tool-call and reasoning parsers use model-based auto-detection by default. Use
 `--tool-call-parser` and `--reasoning-parser` to override either selection;

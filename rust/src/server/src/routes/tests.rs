@@ -591,38 +591,6 @@ fn qwen_multimodal_model_info_with_limits(
     info
 }
 
-fn qwen3_multimodal_model_info() -> vllm_chat::multimodal::MultimodalModelInfo {
-    let config_path = std::env::temp_dir().join(format!(
-        "vllm-server-qwen3-config-{}.json",
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(
-        &config_path,
-        r#"{
-            "model_type":"qwen3_vl",
-            "image_token_id":151655,
-            "vision_start_token_id":151652,
-            "vision_end_token_id":151653,
-            "vision_config":{"patch_size":16}
-        }"#,
-    )
-    .expect("write Qwen3 test config");
-    let info = vllm_chat::multimodal::MultimodalModelInfo::from_paths(
-        "qwen3-vl-test".to_string(),
-        Some("qwen3_vl".to_string()),
-        vllm_chat::multimodal::MultimodalConfigFiles {
-            config: Some(&config_path),
-            ..Default::default()
-        },
-        Arc::new(fake_chat_tokenizer()),
-        std::collections::HashMap::new(),
-    )
-    .expect("load Qwen3 multimodal info")
-    .expect("Qwen3 multimodal info is registered");
-    let _ = fs::remove_file(config_path);
-    info
-}
-
 async fn test_models_with_engine_outputs_and_backend_inner(
     engine_id: impl Into<EngineId>,
     output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
@@ -706,7 +674,7 @@ fn test_render_app_with_parser_selections(
     reasoning_parser: ParserSelection,
 ) -> axum::Router {
     let backend = Arc::new(FakeChatBackend::with_multimodal_model_info(
-        qwen3_multimodal_model_info(),
+        qwen_multimodal_model_info(),
     ));
     build_render_router(Arc::new(RenderState {
         model: "backend-model".to_string(),
