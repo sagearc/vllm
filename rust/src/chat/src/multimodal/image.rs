@@ -112,3 +112,94 @@ impl MultimodalModelInfo {
             .map_err(|error| multimodal!("image preprocessing task failed: {error}"))?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use image::DynamicImage;
+    use llm_multimodal::{
+        MediaContentPart, PreProcessorConfig, TransformError, VisionPreProcessor,
+    };
+
+    use super::super::tests::qwen3_vl_info;
+    use super::*;
+
+    const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    struct MetadataOnlyProcessor;
+
+    impl VisionPreProcessor for MetadataOnlyProcessor {
+        fn default_mean(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+
+        fn default_std(&self) -> [f64; 3] {
+            [1.0; 3]
+        }
+
+        fn preprocess(
+            &self,
+            _images: &[DynamicImage],
+            _config: &PreProcessorConfig,
+        ) -> std::result::Result<PreprocessedEncoderInputs, TransformError> {
+            panic!("render metadata invoked full image preprocessing")
+        }
+
+        fn calculate_num_tokens(
+            &self,
+            _width: u32,
+            _height: u32,
+            _config: &PreProcessorConfig,
+        ) -> usize {
+            4
+        }
+
+        fn model_name(&self) -> &'static str {
+            "metadata-only-test"
+        }
+    }
+
+    static METADATA_ONLY_PROCESSOR: MetadataOnlyProcessor = MetadataOnlyProcessor;
+
+    async fn fetched_image(info: &MultimodalModelInfo) -> super::super::FetchedMedia {
+        info.fetch_media(vec![MediaContentPart::ImageUrl {
+            url: IMAGE_URL.to_string(),
+            detail: None,
+            uuid: Some("image-1".to_string()),
+        }])
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn render_metadata_does_not_invoke_full_preprocessing() {
+        let mut info = qwen3_vl_info();
+        info.image.as_mut().unwrap().processor = &METADATA_ONLY_PROCESSOR;
+        let fetched = fetched_image(&info).await;
+
+        let prepared = info.prepare_image_metadata(fetched.images, fetched.image_uuids).unwrap();
+
+        assert_eq!(prepared.replacements[0].tokens.len(), 4);
+        assert!(prepared.items[0].data.is_none());
+        assert_eq!(prepared.items[0].uuid.as_deref(), Some("image-1"));
+    }
+
+    #[tokio::test]
+    async fn render_metadata_matches_inference_placeholder_tokens() {
+        let info = qwen3_vl_info();
+        let fetched = fetched_image(&info).await;
+        let rendered = info
+            .prepare_image_metadata(fetched.images.clone(), fetched.image_uuids.clone())
+            .unwrap();
+        let inferred = info
+            .prepare_images(fetched.images, fetched.image_uuids, ModelDtype::Float32)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rendered.replacements[0].tokens,
+            inferred.replacements[0].tokens
+        );
+        assert!(rendered.items[0].data.is_none());
+        assert!(inferred.items[0].data.is_some());
+    }
+}
