@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use itertools::izip;
-use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs, PromptReplacement};
+use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs};
+use ndarray::{ArrayD, IxDyn};
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 
 use super::{ModalitySupport, MultimodalModelInfo, PreparedItem, PreparedMedia, item};
@@ -49,20 +49,14 @@ impl MultimodalModelInfo {
         })
     }
 
-    pub(super) fn prepare_image_for_render(
+    pub(super) fn prepare_image_metadata(
         &self,
         frames: Vec<Arc<ImageFrame>>,
         uuids: Vec<Option<String>>,
-    ) -> Result<PreparedMedia> {
+    ) -> Result<PreparedMedia<()>> {
         let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Image.to_string(),
         })?;
-        if !matches!(support.spec.raw.name(), "qwen_vl" | "qwen3_vl") {
-            bail_multimodal!(
-                "render-only image metadata is not supported for {}",
-                support.spec.raw.name()
-            );
-        }
         if uuids.len() != frames.len() {
             bail_multimodal!(
                 "number of media UUIDs {} does not match number of media items {}",
@@ -71,32 +65,46 @@ impl MultimodalModelInfo {
             );
         }
 
-        let mut replacements = Vec::with_capacity(frames.len());
-        let mut items = Vec::with_capacity(frames.len());
-        for (frame, uuid) in izip!(frames, uuids) {
-            let count = support.processor.calculate_num_tokens(
-                frame.data().width(),
-                frame.data().height(),
-                &support.config,
+        let item_sizes = frames
+            .iter()
+            .map(|frame| (frame.data().width(), frame.data().height()))
+            .collect::<Vec<_>>();
+        let feature_token_counts = item_sizes
+            .iter()
+            .map(|&(width, height)| {
+                support.processor.calculate_num_tokens(width, height, &support.config)
+            })
+            .collect();
+        // Replacement construction does not consume encoder_input. Leave it
+        // and processor-only metadata empty so specs that need additional
+        // preprocessor output fail the replacement-count check below.
+        let prompt_inputs = PreprocessedEncoderInputs {
+            encoder_input: ArrayD::zeros(IxDyn(&[0])),
+            feature_token_counts,
+            item_sizes,
+            model_specific: Default::default(),
+        };
+        let replacements = support.spec.prompt_replacements_for(&self.context, &prompt_inputs)?;
+        if replacements.len() != frames.len() {
+            bail_multimodal!(
+                "model {} needs additional preprocessor metadata to calculate image placeholders",
+                support.spec.raw.name()
             );
-            replacements.push(PromptReplacement::repeated(
-                Modality::Image,
-                &support.placeholder.token,
-                support.placeholder.embed_token_id as i32,
-                count,
-            ));
-            items.push(PreparedItem {
-                data: None,
-                hash: frame.hash.clone(),
-                uuid,
-            });
         }
 
         Ok(PreparedMedia {
             modality: Modality::Image,
             placeholder: support.placeholder.clone(),
             replacements,
-            items,
+            items: frames
+                .iter()
+                .zip(uuids)
+                .map(|(frame, uuid)| PreparedItem {
+                    data: (),
+                    hash: frame.hash.clone(),
+                    uuid,
+                })
+                .collect(),
         })
     }
 
@@ -185,30 +193,9 @@ mod tests {
         info.image.as_mut().unwrap().processor = &METADATA_ONLY_PROCESSOR;
         let fetched = fetched_image(&info).await;
 
-        let prepared = info.prepare_image_for_render(fetched.images, fetched.image_uuids).unwrap();
+        let prepared = info.prepare_image_metadata(fetched.images, fetched.image_uuids).unwrap();
 
         assert_eq!(prepared.replacements[0].tokens.len(), 4);
-        assert!(prepared.items[0].data.is_none());
         assert_eq!(prepared.items[0].uuid.as_deref(), Some("image-1"));
-    }
-
-    #[tokio::test]
-    async fn render_metadata_matches_inference_placeholder_tokens() {
-        let info = qwen3_vl_info();
-        let fetched = fetched_image(&info).await;
-        let rendered = info
-            .prepare_image_for_render(fetched.images.clone(), fetched.image_uuids.clone())
-            .unwrap();
-        let inferred = info
-            .prepare_images(fetched.images, fetched.image_uuids, ModelDtype::Float32)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            rendered.replacements[0].tokens,
-            inferred.replacements[0].tokens
-        );
-        assert!(rendered.items[0].data.is_none());
-        assert!(inferred.items[0].data.is_some());
     }
 }

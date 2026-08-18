@@ -77,11 +77,7 @@ pub(super) fn build_batched_items(
             );
         }
 
-        items.push(PreparedItem {
-            data: Some(data),
-            hash,
-            uuid,
-        });
+        items.push(PreparedItem { data, hash, uuid });
     }
 
     Ok(items)

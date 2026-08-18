@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -75,7 +76,48 @@ fn model_resolution(state: &RenderState) -> LoraModelResolution {
 struct RenderResponse {
     #[serde(flatten)]
     request: GenerateRequest,
-    mm_features: Option<MmFeatures>,
+    features: Option<RenderMultimodalFeatures>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderMultimodalFeatures {
+    mm_hashes: BTreeMap<String, Vec<String>>,
+    mm_placeholders: BTreeMap<String, Vec<RenderPlaceholderRange>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderPlaceholderRange {
+    offset: usize,
+    length: usize,
+}
+
+fn render_multimodal_features(
+    features: MmFeatures,
+) -> Result<Option<RenderMultimodalFeatures>, ApiError> {
+    if features.is_empty() {
+        return Ok(None);
+    }
+
+    let mut mm_hashes = BTreeMap::<String, Vec<String>>::new();
+    let mut mm_placeholders = BTreeMap::<String, Vec<RenderPlaceholderRange>>::new();
+    for feature in features {
+        let hash = feature.mm_hash.ok_or_else(|| {
+            ApiError::server_error("rendered multimodal feature is missing its raw-media hash")
+        })?;
+        mm_hashes.entry(feature.modality.clone()).or_default().push(hash);
+        mm_placeholders
+            .entry(feature.modality)
+            .or_default()
+            .push(RenderPlaceholderRange {
+                offset: feature.mm_position.offset,
+                length: feature.mm_position.length,
+            });
+    }
+
+    Ok(Some(RenderMultimodalFeatures {
+        mm_hashes,
+        mm_placeholders,
+    }))
 }
 
 fn lower_render_request(
@@ -90,7 +132,8 @@ fn lower_render_request(
         .prepare(text_request)
         .map_err(|error| text_submit_error("failed to prepare render request", error))?;
     let token_ids = prepared.generate_request.prompt_token_ids;
-    let mm_features = prepared.generate_request.mm_features;
+    let features =
+        render_multimodal_features(prepared.generate_request.mm_features.unwrap_or_default())?;
     let text_request = prepared.text_request;
 
     let request = GenerateRequest {
@@ -108,10 +151,7 @@ fn lower_render_request(
         other: Default::default(),
     };
     validate_generate_request(&request, &state.served_model_names)?;
-    Ok(RenderResponse {
-        request,
-        mm_features,
-    })
+    Ok(RenderResponse { request, features })
 }
 
 async fn render_chat(

@@ -230,9 +230,8 @@ mod tests {
         .pop()
         .unwrap();
 
-        let data = item.data.as_ref().unwrap();
         assert!(matches!(
-            &data[AUDIO_PRIMARY_KEY].field,
+            &item.data[AUDIO_PRIMARY_KEY].field,
             MmField::Batched(_)
         ));
     }
@@ -264,15 +263,14 @@ mod tests {
         assert_eq!(item.hash, expected_hash);
         assert_eq!(item.uuid.as_deref(), Some("audio-1"));
 
-        let data = item.data.as_ref().unwrap();
-        let features = &data[AUDIO_PRIMARY_KEY];
+        let features = &item.data[AUDIO_PRIMARY_KEY];
         assert!(matches!(&features.field, MmField::Batched(_)));
         assert!(matches!(
             features.data.as_ref(),
             Some(MmKwargValue::Tensor(tensor))
                 if tensor.dtype == "float32" && tensor.shape.first() == Some(&128)
         ));
-        let lengths = &data["audio_feature_lengths"];
+        let lengths = &item.data["audio_feature_lengths"];
         assert!(matches!(&lengths.field, MmField::Batched(_)));
         assert!(matches!(
             lengths.data.as_ref(),
@@ -311,15 +309,14 @@ mod tests {
         assert_eq!(item.hash, expected_hash);
         assert_eq!(item.uuid.as_deref(), Some("audio-1"));
 
-        let data = item.data.as_ref().unwrap();
-        let features = &data[AUDIO_PRIMARY_KEY];
+        let features = &item.data[AUDIO_PRIMARY_KEY];
         assert!(matches!(&features.field, MmField::Flat(_)));
         assert!(matches!(
             features.data.as_ref(),
             Some(MmKwargValue::Tensor(tensor))
                 if tensor.dtype == "float32" && tensor.shape.get(1) == Some(&80)
         ));
-        let count = &data["num_audio_tokens"];
+        let count = &item.data["num_audio_tokens"];
         assert!(matches!(&count.field, MmField::Batched(_)));
         assert!(matches!(
             count.data.as_ref(),

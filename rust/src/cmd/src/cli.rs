@@ -103,7 +103,7 @@ pub enum BenchCommand {
     Serve(vllm_bench::BenchServeArgs),
 }
 
-/// Arguments for the engine-free request renderer.
+/// Arguments for the engine-free text renderer.
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct RenderArgs {
     /// Model identifier or local model directory containing tokenizer files.

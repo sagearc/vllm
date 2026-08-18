@@ -16,7 +16,7 @@ use vllm_text::TextRequestProcessor;
 
 use crate::{HttpListenerMode, listener::Listener};
 
-/// Configuration for the engine-free request rendering server.
+/// Configuration for the engine-free text rendering server.
 #[derive(Debug)]
 pub struct RenderConfig {
     pub model: String,
@@ -82,7 +82,7 @@ async fn build_state(config: &RenderConfig) -> Result<Arc<RenderState>> {
     }))
 }
 
-/// Run the request preprocessing server without starting or connecting to an
+/// Run the preprocessing server without starting or connecting to an
 /// inference engine.
 pub async fn serve_render(config: RenderConfig, shutdown: CancellationToken) -> Result<()> {
     config.validate().context("invalid render server configuration")?;

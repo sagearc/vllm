@@ -168,11 +168,7 @@ fn build_video_item(
         );
     }
 
-    Ok(PreparedItem {
-        data: Some(data),
-        hash,
-        uuid,
-    })
+    Ok(PreparedItem { data, hash, uuid })
 }
 
 #[cfg(test)]
@@ -298,8 +294,7 @@ mod tests {
         )
         .unwrap();
 
-        let data = item.data.as_ref().unwrap();
-        let primary = &data[VIDEO_PRIMARY_KEY];
+        let primary = &item.data[VIDEO_PRIMARY_KEY];
         assert!(matches!(
             &primary.field,
             MmField::Flat(MmFlatField { slices, dim: 0, .. })
@@ -310,7 +305,7 @@ mod tests {
         ));
 
         // Batched metadata drops its singleton batch axis per item.
-        let grid = &data["video_grid_thw"];
+        let grid = &item.data["video_grid_thw"];
         assert!(matches!(&grid.field, MmField::Batched(_)));
         let MmKwargValue::Tensor(grid_tensor) = grid.data.as_ref().unwrap() else {
             panic!("expected tensor value for video_grid_thw");

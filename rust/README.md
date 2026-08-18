@@ -95,12 +95,10 @@ consumed by the Rust `/inference/v1/generate` endpoint.
 
 The render and inference paths use the same `vllm-chat` and `vllm-text`
 request-preparation logic; render mode stops before engine submission. For
-multimodal chat requests, `mm_features` contain raw-media hashes, identifiers,
-and expanded placeholder positions, but omit preprocessed tensor `data`.
-Qwen VL image placeholder metadata is calculated from decoded dimensions
-without constructing encoder tensors. Other render-only multimodal inputs are
-not yet supported. These metadata-only results are suitable for routing and
-cache lookup, not direct inference.
+supported multimodal image requests, `features` contains raw-media hashes and
+expanded placeholder positions without constructing or serializing encoder
+tensors. These metadata-only results are suitable for routing and cache lookup,
+not direct inference.
 
 Tool-call and reasoning parsers use model-based auto-detection by default. Use
 `--tool-call-parser` and `--reasoning-parser` to override either selection;

@@ -326,18 +326,18 @@ struct FetchedMedia {
 
 /// One modality's preprocessed output, ready for the shared expansion and
 /// feature-assembly tail.
-struct PreparedMedia {
+struct PreparedMedia<T = MmKwargsItem> {
     modality: Modality,
     placeholder: ResolvedPlaceholder,
     /// One replacement per media item, in request order.
     replacements: Vec<PromptReplacement>,
     /// One entry per media item, aligned with `replacements`.
-    items: Vec<PreparedItem>,
+    items: Vec<PreparedItem<T>>,
 }
 
-/// One media item's optional engine kwargs plus identity metadata.
-struct PreparedItem {
-    data: Option<MmKwargsItem>,
+/// One media item's complete engine kwargs plus identity metadata.
+struct PreparedItem<T = MmKwargsItem> {
+    data: T,
     hash: String,
     uuid: Option<String>,
 }
@@ -740,7 +740,7 @@ impl MultimodalModelInfo {
             prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
         }
 
-        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids)
+        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids, Some)
     }
 
     /// Fetch image metadata, expand prompt placeholders, and build render-only
@@ -762,21 +762,20 @@ impl MultimodalModelInfo {
 
         let mut prepared = Vec::new();
         if !fetched.images.is_empty() {
-            prepared.push(self.prepare_image_for_render(fetched.images, fetched.image_uuids)?);
+            prepared.push(self.prepare_image_metadata(fetched.images, fetched.image_uuids)?);
         }
 
-        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids)
+        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids, |_| None)
     }
 
-    /// Expand media markers and assemble engine-compatible feature metadata.
-    fn build_multimodal_features(
+    fn build_multimodal_features<T>(
         &self,
         media_parts_len: usize,
-        prepared: Vec<PreparedMedia>,
+        prepared: Vec<PreparedMedia<T>>,
         prompt_token_ids: &mut Vec<u32>,
+        into_data: impl Fn(T) -> Option<MmKwargsItem>,
     ) -> Result<MmFeatures> {
         let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
-
         let mut features = Vec::with_capacity(media_parts_len);
         for media in prepared {
             let media_ranges = ranges.remove(&media.modality).unwrap_or_default();
@@ -790,7 +789,7 @@ impl MultimodalModelInfo {
             }
             for (item, range) in izip!(media.items, media_ranges) {
                 features.push(MmFeatureSpec {
-                    data: item.data,
+                    data: into_data(item.data),
                     modality: media.modality.to_string(),
                     identifier: item.uuid.unwrap_or_else(|| item.hash.clone()),
                     mm_position: range,
@@ -798,6 +797,7 @@ impl MultimodalModelInfo {
                 });
             }
         }
+
         // Mirror the Python frontend (`argsort_mm_positions`): features are
         // ordered by their placeholder position in the prompt.
         features.sort_by_key(|feature| feature.mm_position.offset);
