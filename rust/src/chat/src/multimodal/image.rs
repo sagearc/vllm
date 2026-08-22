@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs};
+use ndarray::{ArrayD, IxDyn};
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 
-use super::{ModalitySupport, MultimodalModelInfo, PreparedMedia, item};
+use super::{ModalitySupport, MultimodalModelInfo, PreparedItem, PreparedMedia, item};
 use crate::error::{Error, Result, bail_multimodal, multimodal};
 
 /// Forward-kwargs name of the primary image encoder input.
@@ -48,6 +49,65 @@ impl MultimodalModelInfo {
         })
     }
 
+    pub(super) fn prepare_image_metadata(
+        &self,
+        frames: Vec<Arc<ImageFrame>>,
+        uuids: Vec<Option<String>>,
+    ) -> Result<PreparedMedia<()>> {
+        let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
+            modality: Modality::Image.to_string(),
+        })?;
+        if uuids.len() != frames.len() {
+            bail_multimodal!(
+                "number of media UUIDs {} does not match number of media items {}",
+                uuids.len(),
+                frames.len()
+            );
+        }
+
+        let item_sizes = frames
+            .iter()
+            .map(|frame| (frame.data().width(), frame.data().height()))
+            .collect::<Vec<_>>();
+        let feature_token_counts = item_sizes
+            .iter()
+            .map(|&(width, height)| {
+                support.processor.calculate_num_tokens(width, height, &support.config)
+            })
+            .collect();
+        // Replacement construction does not consume encoder_input. Leave it
+        // and processor-only metadata empty so specs that need additional
+        // preprocessor output fail the replacement-count check below.
+        let prompt_inputs = PreprocessedEncoderInputs {
+            encoder_input: ArrayD::zeros(IxDyn(&[0])),
+            feature_token_counts,
+            item_sizes,
+            model_specific: Default::default(),
+        };
+        let replacements = support.spec.prompt_replacements_for(&self.context, &prompt_inputs)?;
+        if replacements.len() != frames.len() {
+            bail_multimodal!(
+                "model {} needs additional preprocessor metadata to calculate image placeholders",
+                support.spec.raw.name()
+            );
+        }
+
+        Ok(PreparedMedia {
+            modality: Modality::Image,
+            placeholder: support.placeholder.clone(),
+            replacements,
+            items: frames
+                .iter()
+                .zip(uuids)
+                .map(|(frame, uuid)| PreparedItem {
+                    data: (),
+                    hash: frame.hash.clone(),
+                    uuid,
+                })
+                .collect(),
+        })
+    }
+
     /// Preprocess fetched image frames with the model's resolved vision
     /// processor.
     ///
@@ -67,5 +127,75 @@ impl MultimodalModelInfo {
         tokio::task::spawn_blocking(move || Ok(processor.preprocess(&images, &config)?))
             .await
             .map_err(|error| multimodal!("image preprocessing task failed: {error}"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use image::DynamicImage;
+    use llm_multimodal::{
+        MediaContentPart, PreProcessorConfig, TransformError, VisionPreProcessor,
+    };
+
+    use super::super::tests::qwen3_vl_info;
+    use super::*;
+
+    const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    struct MetadataOnlyProcessor;
+
+    impl VisionPreProcessor for MetadataOnlyProcessor {
+        fn default_mean(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+
+        fn default_std(&self) -> [f64; 3] {
+            [1.0; 3]
+        }
+
+        fn preprocess(
+            &self,
+            _images: &[DynamicImage],
+            _config: &PreProcessorConfig,
+        ) -> std::result::Result<PreprocessedEncoderInputs, TransformError> {
+            panic!("render metadata invoked full image preprocessing")
+        }
+
+        fn calculate_num_tokens(
+            &self,
+            _width: u32,
+            _height: u32,
+            _config: &PreProcessorConfig,
+        ) -> usize {
+            4
+        }
+
+        fn model_name(&self) -> &'static str {
+            "metadata-only-test"
+        }
+    }
+
+    static METADATA_ONLY_PROCESSOR: MetadataOnlyProcessor = MetadataOnlyProcessor;
+
+    async fn fetched_image(info: &MultimodalModelInfo) -> super::super::FetchedMedia {
+        info.fetch_media(vec![MediaContentPart::ImageUrl {
+            url: IMAGE_URL.to_string(),
+            detail: None,
+            uuid: Some("image-1".to_string()),
+        }])
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn render_metadata_does_not_invoke_full_preprocessing() {
+        let mut info = qwen3_vl_info();
+        info.image.as_mut().unwrap().processor = &METADATA_ONLY_PROCESSOR;
+        let fetched = fetched_image(&info).await;
+
+        let prepared = info.prepare_image_metadata(fetched.images, fetched.image_uuids).unwrap();
+
+        assert_eq!(prepared.replacements[0].tokens.len(), 4);
+        assert_eq!(prepared.items[0].uuid.as_deref(), Some("image-1"));
     }
 }

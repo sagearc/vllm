@@ -95,13 +95,17 @@ pub fn validate_parser_overrides(
 /// Chat request preparation shared by inference and render-only frontends.
 pub struct ChatRequestProcessor {
     backend: DynChatBackend,
-    /// Effective model dtype reported by the engine.
-    /// Absent for text-only frontends without an engine handshake.
-    model_dtype: Option<ModelDtype>,
+    multimodal_preparation: MultimodalPreparation,
     /// Tool-call parser selection used when preparing generation requests.
     tool_call_parser: ParserSelection,
     /// Reasoning parser selection used when preparing generation requests.
     reasoning_parser: ParserSelection,
+}
+
+#[derive(Clone, Copy)]
+enum MultimodalPreparation {
+    Inference(ModelDtype),
+    Render,
 }
 
 impl ChatRequestProcessor {
@@ -110,17 +114,17 @@ impl ChatRequestProcessor {
     fn new(backend: DynChatBackend, model_dtype: ModelDtype) -> Self {
         Self {
             backend,
-            model_dtype: Some(model_dtype),
+            multimodal_preparation: MultimodalPreparation::Inference(model_dtype),
             tool_call_parser: ParserSelection::Auto,
             reasoning_parser: ParserSelection::Auto,
         }
     }
 
-    /// Create a render-only processor that rejects multimodal requests.
+    /// Create a render-only processor that omits multimodal tensor data.
     pub fn render_only(backend: DynChatBackend) -> Self {
         Self {
             backend,
-            model_dtype: None,
+            multimodal_preparation: MultimodalPreparation::Render,
             tool_call_parser: ParserSelection::Auto,
             reasoning_parser: ParserSelection::Auto,
         }
@@ -142,8 +146,8 @@ impl ChatRequestProcessor {
         request: &ChatRequest,
         rendered: RenderedPrompt,
     ) -> Result<(Prompt, Option<MmFeatures>)> {
-        match self.model_dtype {
-            Some(model_dtype) => {
+        match self.multimodal_preparation {
+            MultimodalPreparation::Inference(model_dtype) => {
                 multimodal::finalize_rendered_prompt(
                     request,
                     rendered,
@@ -152,8 +156,14 @@ impl ChatRequestProcessor {
                 )
                 .await
             }
-            None if !request.has_multimodal() => Ok((rendered.prompt, None)),
-            None => Err(Error::UnsupportedMultimodalRenderer),
+            MultimodalPreparation::Render => {
+                multimodal::finalize_render_prompt(
+                    request,
+                    rendered,
+                    self.backend.multimodal_model_info(),
+                )
+                .await
+            }
         }
     }
 
@@ -170,7 +180,9 @@ impl ChatRequestProcessor {
             .backend
             .multimodal_model_info()
             .ok_or(Error::UnsupportedMultimodalRenderer)?;
-        let model_dtype = self.model_dtype.ok_or(Error::UnsupportedMultimodalRenderer)?;
+        let MultimodalPreparation::Inference(model_dtype) = self.multimodal_preparation else {
+            return Err(Error::UnsupportedMultimodalRenderer);
+        };
         let features = info.prepare_multimodal(media, token_ids, model_dtype).await?;
         Ok(Some(features))
     }
@@ -273,7 +285,7 @@ impl ChatLlm {
 
     /// Override the effective model dtype used for multimodal tensor encoding.
     pub fn with_model_dtype(mut self, model_dtype: ModelDtype) -> Self {
-        self.processor.model_dtype = Some(model_dtype);
+        self.processor.multimodal_preparation = MultimodalPreparation::Inference(model_dtype);
         self
     }
 

@@ -683,6 +683,18 @@ fn test_render_app_with_parser_selections(
     }))
 }
 
+fn test_multimodal_render_app() -> axum::Router {
+    let backend = Arc::new(FakeChatBackend::with_multimodal_model_info(
+        qwen_multimodal_model_info(),
+    ));
+    build_render_router(Arc::new(RenderState {
+        model: "backend-model".to_string(),
+        served_model_names: vec!["render-model".to_string()],
+        text: TextRequestProcessor::new(backend.clone(), 128),
+        chat: ChatRequestProcessor::render_only(backend),
+    }))
+}
+
 async fn test_app_with_dev_mode(dev_mode_enabled: bool) -> axum::Router {
     let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
         b"engine-openai",
@@ -1084,6 +1096,58 @@ async fn render_chat_returns_generate_request_with_header_request_id() {
     assert_eq!(json["sampling_params"]["max_tokens"], 8);
     assert!(!json["token_ids"].as_array().unwrap().is_empty());
     assert!(json.get("prompt_token_ids").is_none());
+    assert!(json.get("features").is_none());
+}
+
+#[tokio::test]
+async fn render_chat_returns_hashes_and_placeholders_without_tensor_data() {
+    let mut app = test_multimodal_render_app();
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/render")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "render-model",
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                                }
+                            }]
+                        }],
+                        "max_completion_tokens": 8
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+
+    let hashes = json["features"]["mm_hashes"]["image"].as_array().unwrap();
+    let placeholders = json["features"]["mm_placeholders"]["image"].as_array().unwrap();
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(placeholders.len(), 1);
+    assert_eq!(
+        hashes[0],
+        "62439026688e1c3693767c6bbe3763b232867f9f111f2f35e00f912b480ce149"
+    );
+    let placeholder = &placeholders[0];
+    assert!(
+        placeholder["offset"].as_u64().unwrap()
+            < json["token_ids"].as_array().unwrap().len() as u64
+    );
+    assert!(placeholder["length"].as_u64().unwrap() > 1);
+    assert!(json["features"].get("kwargs_data").is_none());
     assert!(json.get("mm_features").is_none());
 }
 

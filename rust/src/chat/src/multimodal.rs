@@ -9,7 +9,7 @@
 //! and builds the engine-facing `MmFeatures` payload.
 //!
 //! Raw media stays above `vllm-text`; this module lowers it into token IDs and
-//! opaque tensor payloads before the request is handed to text generation.
+//! multimodal metadata, with tensor payloads included for inference.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -326,18 +326,18 @@ struct FetchedMedia {
 
 /// One modality's preprocessed output, ready for the shared expansion and
 /// feature-assembly tail.
-struct PreparedMedia {
+struct PreparedMedia<T = MmKwargsItem> {
     modality: Modality,
     placeholder: ResolvedPlaceholder,
     /// One replacement per media item, in request order.
     replacements: Vec<PromptReplacement>,
     /// One entry per media item, aligned with `replacements`.
-    items: Vec<PreparedItem>,
+    items: Vec<PreparedItem<T>>,
 }
 
 /// One media item's complete engine kwargs plus identity metadata.
-struct PreparedItem {
-    data: MmKwargsItem,
+struct PreparedItem<T = MmKwargsItem> {
+    data: T,
     hash: String,
     uuid: Option<String>,
 }
@@ -548,11 +548,8 @@ impl MultimodalModelInfo {
     }
 }
 
-/// Finalize a rendered chat prompt into text-generation input.
-///
-/// Text-only requests pass through unchanged as `Prompt::Text`. Multimodal
-/// requests are tokenized in chat, their media placeholders are expanded, and
-/// preprocessed media features are attached for engine-core transport.
+/// Finalize a rendered chat prompt into inference input, including multimodal
+/// encoder tensors.
 pub(crate) async fn finalize_rendered_prompt(
     request: &ChatRequest,
     rendered: RenderedPrompt,
@@ -563,7 +560,35 @@ pub(crate) async fn finalize_rendered_prompt(
         return Ok((rendered.prompt, None));
     }
     let info = info.ok_or(Error::UnsupportedMultimodalRenderer)?;
-    let mut prompt_token_ids = match rendered.prompt {
+    let (mut prompt_token_ids, media_parts) =
+        tokenize_prompt_and_extract_media(request, rendered, info)?;
+    let prepared = info.prepare_multimodal(media_parts, &mut prompt_token_ids, model_dtype).await?;
+
+    Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
+}
+
+pub(crate) async fn finalize_render_prompt(
+    request: &ChatRequest,
+    rendered: RenderedPrompt,
+    info: Option<&MultimodalModelInfo>,
+) -> Result<(Prompt, Option<MmFeatures>)> {
+    if !request.has_multimodal() {
+        return Ok((rendered.prompt, None));
+    }
+    let info = info.ok_or(Error::UnsupportedMultimodalRenderer)?;
+    let (mut prompt_token_ids, media_parts) =
+        tokenize_prompt_and_extract_media(request, rendered, info)?;
+    let prepared = info.prepare_multimodal_for_render(media_parts, &mut prompt_token_ids).await?;
+
+    Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
+}
+
+fn tokenize_prompt_and_extract_media(
+    request: &ChatRequest,
+    rendered: RenderedPrompt,
+    info: &MultimodalModelInfo,
+) -> Result<(Vec<u32>, Vec<MediaContentPart>)> {
+    let prompt_token_ids = match rendered.prompt {
         Prompt::Text(prompt) => info
             .context
             .tokenizer()
@@ -571,10 +596,7 @@ pub(crate) async fn finalize_rendered_prompt(
             .map_err(|error| multimodal!("{error}"))?,
         Prompt::TokenIds(token_ids) => token_ids,
     };
-    let media_parts = extract_media_parts(request)?;
-    let prepared = info.prepare_multimodal(media_parts, &mut prompt_token_ids, model_dtype).await?;
-
-    Ok((Prompt::TokenIds(prompt_token_ids), Some(prepared)))
+    Ok((prompt_token_ids, extract_media_parts(request)?))
 }
 
 /// Extract media parts from chat messages in message/content order.
@@ -690,12 +712,8 @@ impl MultimodalModelInfo {
         Ok(())
     }
 
-    /// Run media fetch, per-modality preprocessing, prompt expansion, and
-    /// feature build.
-    ///
-    /// `prompt_token_ids` is mutated in place because placeholder expansion
-    /// changes both the final prompt and the offsets recorded in
-    /// `PlaceholderRange`.
+    /// Fetch and preprocess media, expand prompt placeholders, and build
+    /// inference features containing encoder tensors.
     pub(crate) async fn prepare_multimodal(
         &self,
         media_parts: Vec<MediaContentPart>,
@@ -722,8 +740,42 @@ impl MultimodalModelInfo {
             prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
         }
 
-        let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
+        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids, Some)
+    }
 
+    /// Fetch image metadata, expand prompt placeholders, and build render-only
+    /// features without encoder tensors.
+    pub(crate) async fn prepare_multimodal_for_render(
+        &self,
+        media_parts: Vec<MediaContentPart>,
+        prompt_token_ids: &mut Vec<u32>,
+    ) -> Result<MmFeatures> {
+        let media_parts_len = media_parts.len();
+        if media_parts_len == 0 {
+            return Ok(Vec::new());
+        }
+        self.validate_mm_limits(&media_parts)?;
+        let fetched = self.fetch_media(media_parts).await?;
+        if !fetched.videos.is_empty() || !fetched.audios.is_empty() {
+            bail_multimodal!("render-only metadata currently supports image inputs only");
+        }
+
+        let mut prepared = Vec::new();
+        if !fetched.images.is_empty() {
+            prepared.push(self.prepare_image_metadata(fetched.images, fetched.image_uuids)?);
+        }
+
+        self.build_multimodal_features(media_parts_len, prepared, prompt_token_ids, |_| None)
+    }
+
+    fn build_multimodal_features<T>(
+        &self,
+        media_parts_len: usize,
+        prepared: Vec<PreparedMedia<T>>,
+        prompt_token_ids: &mut Vec<u32>,
+        into_data: impl Fn(T) -> Option<MmKwargsItem>,
+    ) -> Result<MmFeatures> {
+        let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
         let mut features = Vec::with_capacity(media_parts_len);
         for media in prepared {
             let media_ranges = ranges.remove(&media.modality).unwrap_or_default();
@@ -737,7 +789,7 @@ impl MultimodalModelInfo {
             }
             for (item, range) in izip!(media.items, media_ranges) {
                 features.push(MmFeatureSpec {
-                    data: Some(item.data),
+                    data: into_data(item.data),
                     modality: media.modality.to_string(),
                     identifier: item.uuid.unwrap_or_else(|| item.hash.clone()),
                     mm_position: range,
@@ -745,6 +797,7 @@ impl MultimodalModelInfo {
                 });
             }
         }
+
         // Mirror the Python frontend (`argsort_mm_positions`): features are
         // ordered by their placeholder position in the prompt.
         features.sort_by_key(|feature| feature.mm_position.offset);

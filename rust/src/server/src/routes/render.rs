@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -9,7 +10,9 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
+use serde::Serialize;
 use thiserror_ext::AsReport as _;
+use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_text::TextRequest;
 
 use crate::DEFAULT_REQUEST_BODY_LIMIT_BYTES;
@@ -68,18 +71,69 @@ fn model_resolution(state: &RenderState) -> LoraModelResolution {
     }
 }
 
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Serialize)]
+struct RenderResponse {
+    #[serde(flatten)]
+    request: GenerateRequest,
+    features: Option<RenderMultimodalFeatures>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderMultimodalFeatures {
+    mm_hashes: BTreeMap<String, Vec<String>>,
+    mm_placeholders: BTreeMap<String, Vec<RenderPlaceholderRange>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderPlaceholderRange {
+    offset: usize,
+    length: usize,
+}
+
+fn render_multimodal_features(
+    features: MmFeatures,
+) -> Result<Option<RenderMultimodalFeatures>, ApiError> {
+    if features.is_empty() {
+        return Ok(None);
+    }
+
+    let mut mm_hashes = BTreeMap::<String, Vec<String>>::new();
+    let mut mm_placeholders = BTreeMap::<String, Vec<RenderPlaceholderRange>>::new();
+    for feature in features {
+        let hash = feature.mm_hash.ok_or_else(|| {
+            ApiError::server_error("rendered multimodal feature is missing its raw-media hash")
+        })?;
+        mm_hashes.entry(feature.modality.clone()).or_default().push(hash);
+        mm_placeholders
+            .entry(feature.modality)
+            .or_default()
+            .push(RenderPlaceholderRange {
+                offset: feature.mm_position.offset,
+                length: feature.mm_position.length,
+            });
+    }
+
+    Ok(Some(RenderMultimodalFeatures {
+        mm_hashes,
+        mm_placeholders,
+    }))
+}
+
 fn lower_render_request(
     state: &RenderState,
     text_request: TextRequest,
     model: String,
     stream: bool,
     stream_options: Option<StreamOptions>,
-) -> Result<GenerateRequest, ApiError> {
+) -> Result<RenderResponse, ApiError> {
     let prepared = state
         .text
         .prepare(text_request)
         .map_err(|error| text_submit_error("failed to prepare render request", error))?;
     let token_ids = prepared.generate_request.prompt_token_ids;
+    let features =
+        render_multimodal_features(prepared.generate_request.mm_features.unwrap_or_default())?;
     let text_request = prepared.text_request;
 
     let request = GenerateRequest {
@@ -100,14 +154,14 @@ fn lower_render_request(
         other: Default::default(),
     };
     validate_generate_request(&request, &state.served_model_names)?;
-    Ok(request)
+    Ok(RenderResponse { request, features })
 }
 
 async fn render_chat(
     State(state): State<Arc<RenderState>>,
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
-) -> Result<Json<GenerateRequest>, ApiError> {
+) -> Result<Json<RenderResponse>, ApiError> {
     let model = body.model.clone();
     let stream = body.stream;
     let stream_options = body.stream_options.clone();
@@ -131,7 +185,7 @@ async fn render_completion(
     State(state): State<Arc<RenderState>>,
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
-) -> Result<Json<Vec<GenerateRequest>>, ApiError> {
+) -> Result<Json<Vec<RenderResponse>>, ApiError> {
     let model = body.model.clone();
     let stream = body.stream;
     let stream_options = body.stream_options.clone();

@@ -9,7 +9,7 @@ use llm_multimodal::{Modality, PromptReplacement};
 use vllm_engine_core_client::protocol::multimodal::PlaceholderRange;
 use vllm_engine_core_client::protocol::tensor::WireTensor;
 
-use super::PreparedMedia;
+use super::{PreparedMedia, ResolvedPlaceholder};
 use crate::error::{Error, Result, bail_multimodal};
 
 /// One modality's queue of pending placeholder replacements for prompt
@@ -23,17 +23,21 @@ struct ExpansionLane<'a> {
 }
 
 impl<'a> ExpansionLane<'a> {
-    fn from_prepared(media: &'a PreparedMedia) -> Option<Self> {
-        if media.replacements.is_empty() {
+    fn new(
+        modality: Modality,
+        placeholder: &ResolvedPlaceholder,
+        replacements: &'a [PromptReplacement],
+    ) -> Option<Self> {
+        if replacements.is_empty() {
             return None;
         }
 
         Some(Self {
-            modality: media.modality,
-            marker_token_id: media.placeholder.marker_token_id,
-            embed_token_id: media.placeholder.embed_token_id,
-            placeholder_token: media.placeholder.token.clone(),
-            replacements: media.replacements.iter().collect(),
+            modality,
+            marker_token_id: placeholder.marker_token_id,
+            embed_token_id: placeholder.embed_token_id,
+            placeholder_token: placeholder.token.clone(),
+            replacements: replacements.iter().collect(),
         })
     }
 }
@@ -47,11 +51,16 @@ impl<'a> ExpansionLane<'a> {
 ///
 /// The returned ranges point into the already-expanded prompt, grouped per
 /// modality in item order.
-pub(super) fn expand_prompt_token_ids(
+pub(super) fn expand_prompt_token_ids<T>(
     prompt_token_ids: &mut Vec<u32>,
-    prepared: &[PreparedMedia],
+    prepared: &[PreparedMedia<T>],
 ) -> Result<HashMap<Modality, Vec<PlaceholderRange>>> {
-    let mut lanes = prepared.iter().filter_map(ExpansionLane::from_prepared).collect::<Vec<_>>();
+    let mut lanes = prepared
+        .iter()
+        .filter_map(|media| {
+            ExpansionLane::new(media.modality, &media.placeholder, &media.replacements)
+        })
+        .collect::<Vec<_>>();
     if lanes.is_empty() {
         return Ok(HashMap::new());
     }

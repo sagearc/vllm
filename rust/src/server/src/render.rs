@@ -58,7 +58,7 @@ async fn build_state(config: &RenderConfig) -> Result<Arc<RenderState>> {
         LoadModelBackendsOptions {
             generation_config: Default::default(),
             renderer: config.renderer,
-            language_model_only: true,
+            language_model_only: false,
             chat_template: config.chat_template.clone(),
             chat_template_content_format: config.chat_template_content_format,
             default_chat_template_kwargs: config.default_chat_template_kwargs.clone(),
@@ -83,8 +83,8 @@ async fn build_state(config: &RenderConfig) -> Result<Arc<RenderState>> {
     }))
 }
 
-/// Run the text-only preprocessing server without starting or connecting
-/// to an inference engine.
+/// Run the preprocessing server without starting or connecting to an
+/// inference engine.
 pub async fn serve_render(config: RenderConfig, shutdown: CancellationToken) -> Result<()> {
     config.validate().context("invalid render server configuration")?;
     let state = tokio::select! {

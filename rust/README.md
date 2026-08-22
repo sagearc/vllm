@@ -77,8 +77,8 @@ To build the `vllm-rs` in isolation:
 
 ### Engine-free renderer
 
-`vllm-rs render` serves text-only request preprocessing without starting or
-connecting to a Python inference engine:
+`vllm-rs render` serves request preprocessing without starting or connecting
+to a Python inference engine:
 
 ```bash
 cargo run --manifest-path rust/Cargo.toml -p vllm-cmd --release -- \
@@ -86,17 +86,20 @@ cargo run --manifest-path rust/Cargo.toml -p vllm-cmd --release -- \
   --host 127.0.0.1 --max-model-len 32768
 ```
 
-It exposes `/v1/chat/completions/render` and `/v1/completions/render`. Only
-tokenizer and model configuration files are loaded; model weights, PyTorch,
-and vLLM kernels are not required.
+It exposes `/v1/chat/completions/render` and `/v1/completions/render`.
+Tokenizer, model, and multimodal processor configuration files are loaded;
+model weights, PyTorch, and vLLM kernels are not required.
 
-The render endpoints return the public token-in `GenerateRequest` consumed by
-the Rust `/inference/v1/generate` endpoint. A chat render response, or one item
-from a completion render response, can be submitted to that endpoint without
-changing its fields.
+Text-only render responses use the public token-in `GenerateRequest` shape
+consumed by the Rust `/inference/v1/generate` endpoint.
 
 The render and inference paths use the same `vllm-chat` and `vllm-text`
-request-preparation logic; render mode stops before engine submission.
+request-preparation logic; render mode stops before engine submission. For
+supported multimodal image requests, `features` contains raw-media hashes and
+expanded placeholder positions without constructing or serializing encoder
+tensors. These metadata-only results are suitable for routing and cache lookup,
+not direct inference.
+
 Tool-call and reasoning parsers use model-based auto-detection by default. Use
 `--tool-call-parser` and `--reasoning-parser` to override either selection;
 unified parsers require the same selection for both options.
