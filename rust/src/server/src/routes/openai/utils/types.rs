@@ -599,7 +599,7 @@ impl Usage {
 }
 
 /// Mirrors the Python vLLM `PromptTokenUsageInfo` class.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: usize,
 }

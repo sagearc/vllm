@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use crate::SamplingParams;
 use thiserror::Error;
-use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum SamplingParamsError {
@@ -62,14 +62,14 @@ fn validate_repetition_penalty(value: f32) -> Result<(), SamplingParamsError> {
 }
 
 pub(crate) fn validate_resolved_sampling_params(
-    params: &EngineCoreSamplingParams,
+    params: &SamplingParams,
 ) -> Result<(), SamplingParamsError> {
-    validate_temperature(params.temperature)?;
-    validate_top_p(params.top_p)?;
-    validate_min_p(params.min_p)?;
-    validate_frequency_penalty(params.frequency_penalty)?;
-    validate_presence_penalty(params.presence_penalty)?;
-    validate_repetition_penalty(params.repetition_penalty)
+    validate_temperature(params.temperature.expect("sampling defaults resolved"))?;
+    validate_top_p(params.top_p.expect("sampling defaults resolved"))?;
+    validate_min_p(params.min_p.expect("sampling defaults resolved"))?;
+    validate_frequency_penalty(params.frequency_penalty.expect("sampling defaults resolved"))?;
+    validate_presence_penalty(params.presence_penalty.expect("sampling defaults resolved"))?;
+    validate_repetition_penalty(params.repetition_penalty.expect("sampling defaults resolved"))
 }
 
 fn validate_finite(parameter: &'static str, value: f32) -> Result<(), SamplingParamsError> {

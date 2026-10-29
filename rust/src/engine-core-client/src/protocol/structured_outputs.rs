@@ -35,7 +35,7 @@ impl StructuredOutputBackend {
     /// Reject a constraint this backend cannot compile, or would accept but
     /// enforce only in part, as Python's request validation for the backend
     /// does.
-    fn check_supported(self, constraint: &StructuredOutputConstraint) -> Result<()> {
+    pub fn check_supported(self, constraint: &StructuredOutputConstraint) -> Result<()> {
         use StructuredOutputBackend::*;
         use StructuredOutputConstraint::*;
 

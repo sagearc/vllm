@@ -220,12 +220,26 @@ impl FromStr for LoraModulePath {
     }
 }
 
+/// Generation transport selected before frontend startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum GenerationTransport {
+    EngineCore(TransportMode),
+    Http { url: String, max_model_len: u32 },
+}
+
+impl From<TransportMode> for GenerationTransport {
+    fn from(value: TransportMode) -> Self {
+        Self::EngineCore(value)
+    }
+}
+
 /// Normalized runtime configuration for the minimal OpenAI-compatible server.
 #[derive(Educe, Clone, PartialEq, Eq, Serialize)]
 #[educe(Debug)]
 pub struct Config {
     /// Frontend-to-engine transport setup.
-    pub transport_mode: TransportMode,
+    pub transport_mode: GenerationTransport,
     /// Requested frontend-side coordinator behavior.
     pub coordinator_mode: CoordinatorMode,
     /// Backend model identifier used for engine-core loading.
@@ -358,7 +372,25 @@ impl Config {
                 max_logprobs
             );
         }
-        self.transport_mode.validate()?;
+        match &self.transport_mode {
+            GenerationTransport::EngineCore(mode) => mode.validate()?,
+            GenerationTransport::Http { url, max_model_len } => {
+                crate::engine_http_client::generate_url(url)?;
+                if *max_model_len == 0 {
+                    bail!("HTTP generation requires a positive --max-model-len");
+                }
+                if self.grpc_listener_mode.is_some()
+                    || !self.lora_modules.is_empty()
+                    || self.profiler.is_some()
+                    || self.api_server_options.enable_per_request_metrics
+                    || self.manages_engine
+                {
+                    bail!(
+                        "HTTP generation does not support gRPC, LoRA loading, profiling, per-request engine metrics, or a managed engine"
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -366,8 +398,11 @@ impl Config {
     /// Return the number of engines implied by the configured transport mode.
     pub fn engine_count(&self) -> usize {
         match &self.transport_mode {
-            TransportMode::HandshakeOwner { engine_count, .. }
-            | TransportMode::Bootstrapped { engine_count, .. } => *engine_count,
+            GenerationTransport::EngineCore(
+                TransportMode::HandshakeOwner { engine_count, .. }
+                | TransportMode::Bootstrapped { engine_count, .. },
+            ) => *engine_count,
+            GenerationTransport::Http { .. } => 0,
         }
     }
 

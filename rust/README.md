@@ -1,6 +1,6 @@
 # vllm-frontend-rs
 
-This is a Rust drop-in alternative frontend for vLLM. The current goal is to rebuild the northbound serving layer in Rust while still talking to the core Python vLLM engine process(es) via ZMQ over the existing engine boundary.
+This is a Rust drop-in alternative frontend for vLLM. It implements the northbound serving layer and connects to engine processes over ZMQ or token generation servers over HTTP.
 
 It should still be considered experimental, and is not feature-complete. We are working to add more functionality from the python front-end.
 
@@ -74,6 +74,47 @@ updates and `/update_weight_version` and `/weight_info` for version tracking.
 For trainer-side usage, see the [IPC](../examples/rl/rlhf_http_ipc.py) and
 [NCCL](../examples/rl/rlhf_http_nccl.py) examples. Configure the weight-transfer
 backend on the server and pause generation during updates, as shown there.
+
+### HTTP generation through a gateway
+
+Run the Rust chat frontend without a local engine or ZMQ handshake:
+
+```bash
+vllm-rs serve Qwen/Qwen3-0.6B \
+  --generation-url http://gateway:8080 \
+  --max-model-len 32768
+```
+
+The frontend sends prepared token IDs to `/inference/v1/generate` under the
+gateway base URL. Configure the gateway and EPP to route that path to generation
+pods running `vllm serve MODEL --tokens-only` or `--enable-scale-out`. The pods
+need an HTTP server in front of their engines. The frontend model, revision,
+generation configuration and context limit must match the downstream deployment.
+`--max-model-len` is required and must be a positive integer. It supplies the
+frontend's context limit for request preparation and metadata responses.
+
+Chat rendering, detokenization, stop-string matching, reasoning and tool parsing
+run in the Rust frontend. Request preparation resolves sampling defaults before
+backend selection. The native backend then lowers to engine-core parameters;
+the HTTP adapter serializes the resolved semantics with the existing generate
+wire schema. Both return token outputs to the same processing pipeline. Dropping a
+request closes its upstream response; the gateway must propagate disconnects
+for downstream cancellation. Responses must be streamed without buffering.
+Upstream authentication and gateway/EPP deployment configuration are external to
+this option.
+
+This mode supports text generation with one output sequence. Both streaming and
+non-streaming chat consume an upstream token stream; the frontend collects the
+response for non-streaming clients. Prompt logprobs, multimodal features, LoRA,
+KV hints, pretokenized bad words and selective logprobs
+(`logprob_token_ids` and `prompt_logprob_token_ids`) are rejected. String
+`bad_words` requires a downstream tokenizer. Cached-token usage requires `--enable-prompt-tokens-details` on the
+downstream server. Engine control routes, gRPC, profiling and per-request engine
+metrics are unavailable; `/health` reports frontend readiness.
+
+Upstream submission errors retain their HTTP status and structured error details.
+Engine request timing, speculative metrics, routed-expert metadata and native
+engine metrics are not reconstructed from HTTP token responses.
 
 ### External Engine
 

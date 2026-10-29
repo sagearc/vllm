@@ -26,7 +26,7 @@ use crate::inflight::RequestGuard;
 use crate::request_metrics::{RequestMetricsTracker, current_unix_timestamp_secs};
 
 /// Output tokens `[start, end)` were sampled by weights labelled `version`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightVersionSpan {
     pub version: Arc<str>,
     pub start: usize,

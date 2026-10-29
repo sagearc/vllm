@@ -26,26 +26,53 @@ use crate::backend::{SamplingHints, SamplingLimits};
 use crate::error::{Error, Result};
 use crate::request::{SamplingParams, TextRequest};
 
-/// One text request after it has been lowered into the raw generate boundary.
+/// Prepared generation inputs together with frontend response context.
 #[derive(Debug)]
-pub struct PreparedTextRequest {
+pub struct PreparedTextRequest<S = EngineCoreSamplingParams> {
     /// The high-level request fields still needed for response-side metadata
     /// and decoding options.
     pub text_request: TextRequest,
-    /// The southbound request ready to be sent to `vllm-llm`.
-    pub generate_request: GenerateRequest,
+    /// Generation inputs with semantic or engine-core sampling parameters.
+    pub generate_request: GenerateRequest<S>,
 }
 
 /// Convert a high-level [`TextRequest`] into one lower-level
 /// [`GenerateRequest`] ready for the `llm` crate.
 pub fn lower_text_request(
-    mut request: TextRequest,
+    request: TextRequest,
     prompt_token_ids: Vec<u32>,
     sampling_hints: SamplingHints,
     sampling_limits: SamplingLimits,
     structured_outputs_backend: StructuredOutputBackend,
     tokenizer: &dyn Tokenizer,
 ) -> Result<PreparedTextRequest> {
+    let prepared = prepare_text_request(
+        request,
+        prompt_token_ids,
+        &sampling_hints,
+        sampling_limits,
+        structured_outputs_backend,
+    )?;
+    Ok(PreparedTextRequest {
+        text_request: prepared.text_request,
+        generate_request: lower_generate_request(
+            prepared.generate_request,
+            &sampling_hints,
+            sampling_limits,
+            structured_outputs_backend,
+            tokenizer,
+        )?,
+    })
+}
+
+/// Resolve generation semantics while preserving the public sampling representation.
+pub(crate) fn prepare_text_request(
+    mut request: TextRequest,
+    prompt_token_ids: Vec<u32>,
+    sampling_hints: &SamplingHints,
+    sampling_limits: SamplingLimits,
+    structured_outputs_backend: StructuredOutputBackend,
+) -> Result<PreparedTextRequest<SamplingParams>> {
     let prompt_len = prompt_token_ids.len() as u32;
     validate_prompt_token_ids(&prompt_token_ids, &sampling_limits)?;
 
@@ -56,7 +83,7 @@ pub fn lower_text_request(
         // `mm_features`; move them to the engine request to avoid cloning large
         // multimodal tensor payloads.
         mm_features: request.mm_features.take(),
-        sampling_params: lower_sampling_params(
+        sampling_params: resolve_sampling_params(
             SamplingParams {
                 // Move the candidate table rather than cloning it; only lowering reads it.
                 prompt_logprob_token_ids: request.sampling_params.prompt_logprob_token_ids.take(),
@@ -66,7 +93,6 @@ pub fn lower_text_request(
             sampling_limits,
             structured_outputs_backend,
             prompt_len,
-            tokenizer,
         )?,
         cache_salt: request.cache_salt.clone(),
         priority: request.priority,
@@ -86,22 +112,159 @@ pub fn lower_text_request(
     })
 }
 
+pub(crate) fn lower_generate_request(
+    request: GenerateRequest<SamplingParams>,
+    sampling_hints: &SamplingHints,
+    sampling_limits: SamplingLimits,
+    structured_outputs_backend: StructuredOutputBackend,
+    tokenizer: &dyn Tokenizer,
+) -> Result<GenerateRequest> {
+    let sampling_params = encode_sampling_params(
+        request.sampling_params,
+        sampling_hints,
+        sampling_limits,
+        structured_outputs_backend,
+        request.prompt_token_ids.len() as u32,
+        tokenizer,
+    )?;
+    Ok(GenerateRequest {
+        sampling_params,
+        request_id: request.request_id,
+        prompt_token_ids: request.prompt_token_ids,
+        mm_features: request.mm_features,
+        arrival_time: request.arrival_time,
+        cache_salt: request.cache_salt,
+        trace_headers: request.trace_headers,
+        priority: request.priority,
+        data_parallel_rank: request.data_parallel_rank,
+        session_id: request.session_id,
+        kv_hints: request.kv_hints,
+        reasoning_parser_kwargs: request.reasoning_parser_kwargs,
+        reasoning_ended: request.reasoning_ended,
+        lora_request: request.lora_request,
+    })
+}
+
 /// Convert [`SamplingParams`] into [`EngineCoreSamplingParams`], enriching
 /// omitted user values with tokenizer/model-derived hints when available.
 pub fn lower_sampling_params(
     sampling_params: SamplingParams,
-    SamplingHints {
-        primary_eos_token_id,
-        extra_eos_token_ids,
-        default_temperature,
-        default_top_p,
-        default_top_k,
-        default_min_p,
-        default_repetition_penalty,
-        default_presence_penalty,
-        default_frequency_penalty,
-        default_max_tokens,
-    }: SamplingHints,
+    sampling_hints: SamplingHints,
+    sampling_limits: SamplingLimits,
+    structured_outputs_backend: StructuredOutputBackend,
+    prompt_len: u32,
+    tokenizer: &dyn Tokenizer,
+) -> Result<EngineCoreSamplingParams> {
+    let params = resolve_sampling_params(
+        sampling_params,
+        &sampling_hints,
+        sampling_limits,
+        structured_outputs_backend,
+        prompt_len,
+    )?;
+    encode_sampling_params(
+        params,
+        &sampling_hints,
+        sampling_limits,
+        structured_outputs_backend,
+        prompt_len,
+        tokenizer,
+    )
+}
+
+fn resolve_sampling_params(
+    mut params: SamplingParams,
+    hints: &SamplingHints,
+    limits: SamplingLimits,
+    structured_outputs_backend: StructuredOutputBackend,
+    prompt_len: u32,
+) -> Result<SamplingParams> {
+    validate_logprobs(
+        params.logprobs,
+        params.prompt_logprobs,
+        params.logprob_token_ids.as_deref(),
+        params.prompt_logprob_token_ids.as_deref(),
+        params.prompt_logprob_start,
+        limits,
+    )?;
+    validate_repetition_detection(params.repetition_detection.as_ref())?;
+    // Python validates against the (multimodal-expanded) prompt length.
+    let start = params.routed_experts_prompt_start.unwrap_or(0);
+    if start > prompt_len {
+        return Err(SamplingParamsError::RoutedExpertsPromptStartOutOfRange {
+            value: start,
+            prompt_len,
+        }
+        .into());
+    }
+    // Validate the final constraint against the backend that will compile it:
+    // chat may have replaced the user's constraint with a parser-built output
+    // grammar.
+    if let Some(structured) = &params.structured_outputs {
+        structured.validate()?;
+        structured_outputs_backend.check_supported(&structured.constraint)?;
+    }
+    // Mirrors the model-generation-config inheritance used by vLLM's OpenAI chat
+    // path: https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/entrypoints/openai/chat_completion/protocol.py#L424-L450
+    // If neither the caller nor the model provides a value, fall back to 1.0 — the
+    // default used by the Python vLLM OpenAI-compatible API (via
+    // `_DEFAULT_SAMPLING_PARAMS`).
+    params.temperature = Some(params.temperature.or(hints.default_temperature).unwrap_or(1.0));
+    params.top_p = Some(params.top_p.or(hints.default_top_p).unwrap_or(1.0));
+    params.top_k = Some(params.top_k.or(hints.default_top_k).unwrap_or(0));
+    params.min_p = Some(params.min_p.or(hints.default_min_p).unwrap_or(0.0));
+    params.repetition_penalty =
+        Some(params.repetition_penalty.or(hints.default_repetition_penalty).unwrap_or(1.0));
+    params.presence_penalty =
+        Some(params.presence_penalty.or(hints.default_presence_penalty).unwrap_or(0.0));
+    params.frequency_penalty =
+        Some(params.frequency_penalty.or(hints.default_frequency_penalty).unwrap_or(0.0));
+    let max_tokens = resolve_max_tokens(
+        params.max_tokens,
+        hints.default_max_tokens,
+        limits.max_model_len,
+        prompt_len,
+    )?;
+    let min_tokens = params.min_tokens.unwrap_or(0);
+    if min_tokens > max_tokens {
+        return Err(Error::MinTokensExceedsMaxTokens {
+            min_tokens,
+            max_tokens,
+        });
+    }
+    params.max_tokens = Some(max_tokens);
+    params.min_tokens = Some(min_tokens);
+    params.thinking_token_budget =
+        normalize_thinking_token_budget(params.thinking_token_budget)?.map(|value| value as i64);
+    // Like Python's `SamplingParams.from_optional`, clamp biases to
+    // [-100, 100] instead of passing extreme values to the sampler.
+    if let Some(biases) = &mut params.logit_bias {
+        for bias in biases.values_mut() {
+            *bias = bias.clamp(-100.0, 100.0);
+        }
+    }
+    if params
+        .bad_words
+        .as_ref()
+        .is_some_and(|words| words.iter().any(String::is_empty))
+    {
+        return Err(TokenIdsError::EmptyBadWord.into());
+    }
+    validate_resolved_sampling_params(&params)?;
+    validate_vocab_range(
+        params.stop_token_ids.as_deref().unwrap_or_default(),
+        params.allowed_token_ids.as_deref(),
+        params.logit_bias.as_ref(),
+        params.logprob_token_ids.as_deref(),
+        params.bad_words_token_ids.as_deref(),
+        &limits,
+    )?;
+    Ok(params)
+}
+
+fn encode_sampling_params(
+    sampling_params: SamplingParams,
+    sampling_hints: &SamplingHints,
     sampling_limits: SamplingLimits,
     structured_outputs_backend: StructuredOutputBackend,
     prompt_len: u32,
@@ -139,58 +302,12 @@ pub fn lower_sampling_params(
         stream_interval,
     } = sampling_params;
 
-    validate_logprobs(
-        logprobs,
-        prompt_logprobs,
-        logprob_token_ids.as_deref(),
-        prompt_logprob_token_ids.as_deref(),
-        prompt_logprob_start,
-        sampling_limits,
-    )?;
-    validate_repetition_detection(repetition_detection.as_ref())?;
-    // Python validates against the (multimodal-expanded) prompt length.
-    let routed_experts_prompt_start = routed_experts_prompt_start.unwrap_or(0);
-    if routed_experts_prompt_start > prompt_len {
-        return Err(SamplingParamsError::RoutedExpertsPromptStartOutOfRange {
-            value: routed_experts_prompt_start,
-            prompt_len,
-        }
-        .into());
-    }
-    // Validate the final constraint against the backend that will compile it:
-    // chat may have replaced the user's constraint with a parser-built output
-    // grammar.
-    let structured_outputs = structured_outputs
-        .map(|params| EngineCoreStructuredOutputsParams::new(params, structured_outputs_backend))
-        .transpose()?;
-
-    // Mirrors the model-generation-config inheritance used by vLLM's OpenAI chat
-    // path: https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/entrypoints/openai/chat_completion/protocol.py#L424-L450
-    // If neither the caller nor the model provides a value, fall back to 1.0 — the
-    // default used by the Python vLLM OpenAI-compatible API (via
-    // `_DEFAULT_SAMPLING_PARAMS`).
-    let temperature = temperature.or(default_temperature).unwrap_or(1.0);
-    let top_p = top_p.or(default_top_p).unwrap_or(1.0);
-    let top_k = top_k.or(default_top_k).unwrap_or(0);
-    let min_p = min_p.or(default_min_p).unwrap_or(0.0);
-    let repetition_penalty = repetition_penalty.or(default_repetition_penalty).unwrap_or(1.0);
-    let presence_penalty = presence_penalty.or(default_presence_penalty).unwrap_or(0.0);
-    let frequency_penalty = frequency_penalty.or(default_frequency_penalty).unwrap_or(0.0);
-    let max_tokens = resolve_max_tokens(
-        max_tokens,
-        default_max_tokens,
-        sampling_limits.max_model_len,
-        prompt_len,
-    )?;
-    let min_tokens = min_tokens.unwrap_or(0);
-    if min_tokens > max_tokens {
-        return Err(Error::MinTokensExceedsMaxTokens {
-            min_tokens,
-            max_tokens,
-        });
-    }
-    let thinking_token_budget = normalize_thinking_token_budget(thinking_token_budget)?;
-
+    let primary_eos_token_id = sampling_hints.primary_eos_token_id;
+    let extra_eos_token_ids = &sampling_hints.extra_eos_token_ids;
+    let structured_outputs = structured_outputs.map(|params| EngineCoreStructuredOutputsParams {
+        params,
+        backend: structured_outputs_backend,
+    });
     let mut stop_token_ids = stop_token_ids.unwrap_or_default();
     let mut all_stop_token_ids = BTreeSet::from_iter(stop_token_ids.iter().copied());
     if let Some(primary_eos_token_id) = primary_eos_token_id {
@@ -208,14 +325,14 @@ pub fn lower_sampling_params(
     }
 
     let params = EngineCoreSamplingParams {
-        temperature,
+        temperature: temperature.expect("sampling defaults resolved"),
         watermarking: watermarking.unwrap_or(true),
-        top_p,
-        top_k,
+        top_p: top_p.expect("sampling defaults resolved"),
+        top_k: top_k.expect("sampling defaults resolved"),
         seed,
-        max_tokens,
-        min_tokens,
-        thinking_token_budget,
+        max_tokens: max_tokens.expect("sampling defaults resolved"),
+        min_tokens: min_tokens.expect("sampling defaults resolved"),
+        thinking_token_budget: thinking_token_budget.map(|value| value as u64),
         logprobs,
         prompt_logprobs,
         prompt_logprob_token_ids: lower_prompt_logprob_token_ids(
@@ -225,22 +342,15 @@ pub fn lower_sampling_params(
             sampling_limits.model_vocab_size,
         )?,
         prompt_logprob_start,
-        min_p,
-        frequency_penalty,
-        presence_penalty,
-        repetition_penalty,
+        min_p: min_p.expect("sampling defaults resolved"),
+        frequency_penalty: frequency_penalty.expect("sampling defaults resolved"),
+        presence_penalty: presence_penalty.expect("sampling defaults resolved"),
+        repetition_penalty: repetition_penalty.expect("sampling defaults resolved"),
         repetition_detection: repetition_detection.filter(|p| !p.is_disabled()),
         stop_token_ids,
         eos_token_id: (!ignore_eos).then_some(primary_eos_token_id).flatten(),
         all_stop_token_ids,
-        // Like Python's `SamplingParams.from_optional`, clamp biases to
-        // [-100, 100] instead of passing extreme values to the sampler.
-        logit_bias: logit_bias.map(|logit_bias| {
-            logit_bias
-                .into_iter()
-                .map(|(token_id, bias)| (token_id, bias.clamp(-100.0, 100.0)))
-                .collect()
-        }),
+        logit_bias,
         allowed_token_ids,
         bad_words_token_ids: (!bad_words_token_ids.is_empty()).then_some(bad_words_token_ids),
         // TODO: Validate structured-output schemas and regexes before submitting requests to engine-core.
@@ -248,11 +358,17 @@ pub fn lower_sampling_params(
         logprob_token_ids,
         skip_reading_prefix_cache,
         extra_args: vllm_xargs,
-        routed_experts_prompt_start,
+        routed_experts_prompt_start: routed_experts_prompt_start.unwrap_or(0),
         stream_interval,
     };
-    validate_resolved_sampling_params(&params)?;
-    validate_vocab_range(&params, &sampling_limits)?;
+    validate_vocab_range(
+        &params.stop_token_ids,
+        params.allowed_token_ids.as_deref(),
+        params.logit_bias.as_ref(),
+        params.logprob_token_ids.as_deref(),
+        params.bad_words_token_ids.as_deref(),
+        &sampling_limits,
+    )?;
     Ok(params)
 }
 
@@ -779,6 +895,71 @@ mod tests {
         .unwrap();
 
         assert_eq!(params.repetition_penalty, 2.5);
+    }
+
+    #[test]
+    fn generation_preparation_preserves_semantics_until_native_encoding() {
+        let hints = SamplingHints {
+            default_temperature: Some(0.7),
+            primary_eos_token_id: Some(2),
+            extra_eos_token_ids: BTreeSet::from([3]),
+            ..Default::default()
+        };
+        let limits = SamplingLimits {
+            max_model_len: 16,
+            ..sample_sampling_limits()
+        };
+        for ignore_eos in [false, true] {
+            let request = TextRequest {
+                sampling_params: SamplingParams {
+                    ignore_eos,
+                    stop_token_ids: Some(vec![7]),
+                    bad_words: Some(vec!["hi".into()]),
+                    max_tokens: Some(100),
+                    ..Default::default()
+                },
+                ..TextRequest::for_test()
+            };
+            let prepared = prepare_text_request(
+                request,
+                vec![10, 20],
+                &hints,
+                limits,
+                StructuredOutputBackend::default(),
+            )
+            .unwrap();
+            let sampling = &prepared.generate_request.sampling_params;
+            assert_eq!(sampling.temperature, Some(0.7));
+            assert_eq!(sampling.max_tokens, Some(14));
+            assert_eq!(sampling.ignore_eos, ignore_eos);
+            assert_eq!(sampling.stop_token_ids.as_deref(), Some([7].as_slice()));
+            assert_eq!(
+                sampling.bad_words.as_deref(),
+                Some(["hi".to_owned()].as_slice())
+            );
+            assert!(sampling.bad_words_token_ids.is_none());
+
+            let native = lower_generate_request(
+                prepared.generate_request,
+                &hints,
+                limits,
+                StructuredOutputBackend::default(),
+                &stub_tokenizer(),
+            )
+            .unwrap();
+            assert_eq!(
+                native.sampling_params.eos_token_id,
+                (!ignore_eos).then_some(2)
+            );
+            assert_eq!(
+                native.sampling_params.stop_token_ids,
+                if ignore_eos { vec![7] } else { vec![7, 3] }
+            );
+            assert_eq!(
+                native.sampling_params.bad_words_token_ids,
+                Some(vec![vec![104, 105]])
+            );
+        }
     }
 
     #[test]

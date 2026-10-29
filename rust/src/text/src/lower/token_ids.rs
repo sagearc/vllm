@@ -3,8 +3,8 @@
 
 use std::result::Result;
 
+use std::collections::HashMap;
 use thiserror::Error;
-use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
 use crate::SamplingLimits;
 
@@ -106,16 +106,20 @@ pub(crate) fn validate_prompt_token_ids(
 /// Validate that token IDs in text sampling parameters are within their
 /// parameter-specific vocabulary ranges.
 pub(crate) fn validate_vocab_range(
-    params: &EngineCoreSamplingParams,
+    stop_token_ids: &[u32],
+    allowed_token_ids: Option<&[u32]>,
+    logit_bias: Option<&HashMap<u32, f32>>,
+    logprob_token_ids: Option<&[u32]>,
+    bad_words_token_ids: Option<&[Vec<u32>]>,
     limits: &SamplingLimits,
 ) -> Result<(), TokenIdsError> {
     validate_param(
         "stop_token_ids",
-        params.stop_token_ids.iter().copied(),
+        stop_token_ids.iter().copied(),
         limits.model_vocab_size,
     )?;
 
-    if let Some(token_ids) = params.allowed_token_ids.as_deref() {
+    if let Some(token_ids) = allowed_token_ids {
         if token_ids.is_empty() {
             return Err(TokenIdsError::EmptyAllowedTokenIds);
         }
@@ -126,7 +130,7 @@ pub(crate) fn validate_vocab_range(
         )?;
     }
 
-    if let Some(logit_bias) = params.logit_bias.as_ref() {
+    if let Some(logit_bias) = logit_bias {
         validate_param(
             "logit_bias",
             logit_bias.keys().copied(),
@@ -134,7 +138,7 @@ pub(crate) fn validate_vocab_range(
         )?;
     }
 
-    if let Some(token_ids) = params.logprob_token_ids.as_deref() {
+    if let Some(token_ids) = logprob_token_ids {
         validate_param(
             "logprob_token_ids",
             token_ids.iter().copied(),
@@ -142,7 +146,7 @@ pub(crate) fn validate_vocab_range(
         )?;
     }
 
-    if let Some(bad_words_token_ids) = params.bad_words_token_ids.as_deref() {
+    if let Some(bad_words_token_ids) = bad_words_token_ids {
         if bad_words_token_ids.iter().any(Vec::is_empty) {
             return Err(TokenIdsError::EmptyBadWordSequence);
         }

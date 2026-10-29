@@ -13,15 +13,23 @@ use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::utility::PauseMode;
-use vllm_llm::{Error, GenerateOutput, GenerateRequest, Llm, Result};
+use vllm_llm::{Error, GenerateOutput, Llm, Result};
 
+use crate::{SamplingParams, TextRequestProcessor};
+
+/// Token IDs and resolved sampling semantics before destination-specific encoding.
+pub type GenerationRequest = vllm_llm::GenerateRequest<SamplingParams>;
 pub type TokenStream = BoxStream<'static, Result<GenerateOutput>>;
 
 /// Generation, lifecycle, metadata, and engine operations used by the frontend.
 /// Backends return `UnsupportedOperation` for operations they do not implement.
 pub trait EngineClient: Send + Sync {
-    /// Submit a tokenized request and return its output stream.
-    fn generate<'a>(&'a self, request: GenerateRequest) -> BoxFuture<'a, Result<TokenStream>>;
+    /// Submit resolved semantics, using the processor's native encoder when needed.
+    fn generate<'a>(
+        &'a self,
+        request: GenerationRequest,
+        processor: &'a TextRequestProcessor,
+    ) -> BoxFuture<'a, crate::Result<TokenStream>>;
 
     fn abort<'a>(&'a self, request_ids: &'a [String]) -> BoxFuture<'a, Result<()>>;
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, Result<()>>;
@@ -186,8 +194,14 @@ pub trait EngineClient: Send + Sync {
 }
 
 impl EngineClient for Llm {
-    fn generate<'a>(&'a self, request: GenerateRequest) -> BoxFuture<'a, Result<TokenStream>> {
-        Box::pin(async move { Ok(Llm::generate(self, request).await?.boxed()) })
+    fn generate<'a>(
+        &'a self,
+        request: GenerationRequest,
+        processor: &'a TextRequestProcessor,
+    ) -> BoxFuture<'a, crate::Result<TokenStream>> {
+        Box::pin(async move {
+            Ok(Llm::generate(self, processor.lower_generation(request)?).await?.boxed())
+        })
     }
 
     fn abort<'a>(&'a self, request_ids: &'a [String]) -> BoxFuture<'a, Result<()>> {
