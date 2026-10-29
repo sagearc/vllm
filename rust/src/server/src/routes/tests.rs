@@ -48,10 +48,13 @@ use vllm_engine_core_client::test_utils::{
 use vllm_engine_core_client::{
     ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
 };
-use vllm_llm::{GenerateRequest, Llm, Result as LlmResult};
+use vllm_llm::{Llm, Result as LlmResult};
 use vllm_metrics::METRICS;
 use vllm_text::tokenizer::DynTokenizer;
-use vllm_text::{EngineClient, Prompt, TextBackend, TextLlm, TextRequestProcessor, TokenStream};
+use vllm_text::{
+    EngineClient, GenerationRequest, Prompt, TextBackend, TextLlm, TextRequestProcessor,
+    TokenStream,
+};
 use vllm_tokenizer::Tokenizer as _;
 use vllm_tokenizer::test_utils::TestTokenizer;
 use zeromq::prelude::{SocketRecv, SocketSend};
@@ -1227,7 +1230,11 @@ where
 struct GenerationOnlyClient;
 
 impl EngineClient for GenerationOnlyClient {
-    fn generate<'a>(&'a self, _request: GenerateRequest) -> BoxFuture<'a, LlmResult<TokenStream>> {
+    fn generate<'a>(
+        &'a self,
+        _request: GenerationRequest,
+        _processor: &'a TextRequestProcessor,
+    ) -> BoxFuture<'a, vllm_text::Result<TokenStream>> {
         Box::pin(async { unreachable!("this test does not submit generation") })
     }
 
@@ -6529,6 +6536,214 @@ async fn include_reasoning_false_suppresses_non_stream_output_metadata() {
     assert!(choice["logprobs"].is_null(), "{text}");
     assert!(choice["token_ids"].is_null(), "{text}");
     assert!(json["prompt_token_ids"].is_array(), "{text}");
+}
+
+#[tokio::test]
+async fn http_metadata_uses_configured_context_limit_without_engine_access() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::select! {
+        biased;
+        _ = listener.accept() => panic!("metadata routes must not contact the generation server"),
+        _ = async {
+            for max_model_len in [128, 257] {
+                let client = crate::engine_http_client::EngineHTTPClient::new(
+                    &url, "test-model".into(), std::num::NonZeroU32::MIN, max_model_len,
+                ).unwrap();
+                let backend = Arc::new(FakeChatBackend::new());
+                let chat = ChatLlm::new(
+                    TextLlm::new(client, backend.clone()), backend,
+                );
+                let mut app = build_router(Arc::new(AppState::new(vec!["test-model".into()], chat)));
+                let response = app.call(
+                    Request::builder().uri("/v1/models").body(Body::empty()).unwrap(),
+                ).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(models["data"][0]["max_model_len"], max_model_len);
+
+                let (status, tokens) = post_json(
+                    &mut app, "/tokenize",
+                    json!({"model": "test-model", "prompt": "hello", "add_special_tokens": false}),
+                ).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(tokens["max_model_len"], max_model_len);
+            }
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn http_generation_rejects_prompt_logprobs_before_dispatch() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let downstream = axum::Router::new().route(
+        "/inference/v1/generate",
+        axum::routing::post(move || {
+            sent.send(()).unwrap();
+            async { StatusCode::INTERNAL_SERVER_ERROR }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, downstream).await.unwrap() });
+    let client = crate::engine_http_client::EngineHTTPClient::new(
+        &url,
+        "test-model".into(),
+        std::num::NonZeroU32::MIN,
+        1024,
+    )
+    .unwrap();
+    let backend = Arc::new(FakeChatBackend::new());
+    let chat = ChatLlm::new(vllm_text::TextLlm::new(client, backend.clone()), backend);
+    let mut app = build_router(Arc::new(AppState::new(vec!["test-model".into()], chat)));
+    for prompt_logprobs in [0, 1, -1] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model", "stream": false,
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "prompt_logprobs": prompt_logprobs
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "BadRequestError");
+        assert!(body["error"]["message"].as_str().unwrap().contains("prompt_logprobs"));
+        assert_eq!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn http_generation_preserves_chat_tools_and_reasoning() {
+    for streaming in [false, true] {
+        let mut responses = Vec::new();
+        for remote in [false, true] {
+            let backend = Arc::new(FakeChatBackend::with_model_id("Qwen/Qwen3-0.6B"));
+            let (chat, engine_task) = test_models_with_engine_outputs_and_backend_inner(
+                b"engine-http-chat".to_vec(),
+                |request_id| {
+                    engine_outputs_for_request(request_id, weather_tool_call_output_specs())
+                },
+                |request| assert!(!request.prompt_token_ids.as_ref().unwrap().is_empty()),
+                backend.clone(),
+            )
+            .await;
+            let mut server = None;
+            let chat = if remote {
+                let max_model_len = chat.engine_client().max_model_len();
+                let downstream = build_router_with_scale_out_endpoints(
+                    Arc::new(AppState::new(vec!["test-model".into()], chat)),
+                    true,
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                server = Some(tokio::spawn(async move {
+                    axum::serve(listener, downstream).await.unwrap();
+                }));
+                let client = crate::engine_http_client::EngineHTTPClient::new(
+                    &url,
+                    "test-model".into(),
+                    std::num::NonZeroU32::MIN,
+                    max_model_len,
+                )
+                .unwrap();
+                ChatLlm::new(vllm_text::TextLlm::new(client, backend.clone()), backend)
+            } else {
+                chat
+            };
+            let state = AppState::new(vec!["test-model".into()], chat);
+            let mut app = build_router(Arc::new(state));
+            if remote {
+                for path in ["/health", "/v1/models"] {
+                    assert_eq!(
+                        app.call(Request::builder().uri(path).body(Body::empty()).unwrap())
+                            .await
+                            .unwrap()
+                            .status(),
+                        StatusCode::OK
+                    );
+                }
+                assert_eq!(
+                    app.call(
+                        Request::builder().uri("/kv_event_sources").body(Body::empty()).unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                    StatusCode::NOT_IMPLEMENTED
+                );
+            }
+            let response = app.call(Request::builder().method("POST").uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({
+                    "model": "test-model", "stream": streaming,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                    }}]
+                }).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            let mut values: Vec<serde_json::Value> = if streaming {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect()
+            } else {
+                vec![serde_json::from_str(&text).unwrap()]
+            };
+            // Request IDs, tool IDs and timestamps are intentionally generated per call.
+            fn normalize(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        fields.remove("id");
+                        fields.remove("created");
+                        for value in fields.values_mut() {
+                            normalize(value);
+                        }
+                    }
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            normalize(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for value in &mut values {
+                normalize(value);
+            }
+            let serialized = serde_json::to_string(&values).unwrap();
+            assert!(serialized.contains("get_weather"), "{serialized}");
+            assert!(serialized.contains("Need tool."), "{serialized}");
+            responses.push(values);
+            engine_task.await.unwrap();
+            if let Some(server) = server {
+                server.abort();
+            }
+        }
+        assert_eq!(responses[0], responses[1]);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

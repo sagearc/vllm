@@ -13,7 +13,10 @@ use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use crate::error::{Error, Result};
 use crate::request_metrics::current_unix_timestamp_secs;
 
-/// Tokenized decoder-only generate request accepted by [`crate::Llm`].
+/// Tokenized decoder-only generation inputs.
+///
+/// The default sampling representation is accepted by [`crate::Llm`]. Frontends
+/// can use semantic sampling parameters before selecting a destination encoder.
 ///
 /// This is the first-stage Rust subset of the inputs that eventually flow into
 /// Python `AsyncLLM.generate()`. The boundary is intentionally above
@@ -23,13 +26,13 @@ use crate::request_metrics::current_unix_timestamp_secs;
 /// Original Python API reference:
 /// <https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/engine/protocol.py#L67-L84>
 #[derive(Debug, Clone, PartialEq)]
-pub struct GenerateRequest {
+pub struct GenerateRequest<S = EngineCoreSamplingParams> {
     /// Unique ID of the request.
     pub request_id: String,
     /// Token IDs of the prompt.
     pub prompt_token_ids: Vec<u32>,
-    /// Sampling parameters forwarded to engine-core.
-    pub sampling_params: EngineCoreSamplingParams,
+    /// Sampling parameters at this request preparation stage.
+    pub sampling_params: S,
     /// Optional multimodal features already prepared by `vllm-chat`.
     pub mm_features: Option<MmFeatures>,
     /// Unix timestamp, in seconds, when this request arrived at the frontend.

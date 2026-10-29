@@ -31,7 +31,7 @@ use vllm_tokenizer::DynTokenizer;
 pub mod backend;
 mod engine_client;
 mod error;
-pub use engine_client::{EngineClient, TokenStream};
+pub use engine_client::{EngineClient, GenerationRequest, TokenStream};
 mod lower;
 pub mod output;
 mod request;
@@ -148,7 +148,19 @@ impl TextRequestProcessor {
     }
 
     /// Tokenize and lower one request without submitting it to an engine.
-    pub fn prepare(&self, mut request: TextRequest) -> Result<PreparedTextRequest> {
+    pub fn prepare(&self, request: TextRequest) -> Result<PreparedTextRequest> {
+        let prepared = self.prepare_generation(request)?;
+        Ok(PreparedTextRequest {
+            text_request: prepared.text_request,
+            generate_request: self.lower_generation(prepared.generate_request)?,
+        })
+    }
+
+    /// Tokenize, validate, and resolve defaults without choosing a wire protocol.
+    pub fn prepare_generation(
+        &self,
+        mut request: TextRequest,
+    ) -> Result<PreparedTextRequest<SamplingParams>> {
         request.validate()?;
 
         if request.arrival_time.is_none() {
@@ -160,22 +172,34 @@ impl TextRequestProcessor {
             request.add_special_tokens,
             request.prompt_truncation,
         )?;
-        let tokenizer = self.backend.tokenizer();
         let sampling_hints = self.backend.sampling_hints()?;
-        let sampling_limits = SamplingLimits {
+        let sampling_limits = self.sampling_limits();
+
+        lower::prepare_text_request(
+            request,
+            prompt_token_ids,
+            &sampling_hints,
+            sampling_limits,
+            self.structured_outputs_backend,
+        )
+    }
+
+    fn sampling_limits(&self) -> SamplingLimits {
+        SamplingLimits {
             max_model_len: self.max_model_len,
             max_logprobs: self.max_logprobs,
             model_vocab_size: self.backend.model_vocab_size(),
             tokenizer_vocab_size: self.backend.tokenizer_vocab_size(),
-        };
+        }
+    }
 
-        lower_text_request(
+    fn lower_generation(&self, request: GenerationRequest) -> Result<vllm_llm::GenerateRequest> {
+        lower::lower_generate_request(
             request,
-            prompt_token_ids,
-            sampling_hints,
-            sampling_limits,
+            &self.backend.sampling_hints()?,
+            self.sampling_limits(),
             self.structured_outputs_backend,
-            tokenizer.as_ref(),
+            self.backend.tokenizer().as_ref(),
         )
     }
 }
@@ -218,7 +242,7 @@ impl TextLlm {
         self.processor.backend.model_id()
     }
 
-    /// Return the generation client.
+    /// Return the generation client shared by native and HTTP frontends.
     pub fn engine_client(&self) -> &dyn EngineClient {
         self.client.as_ref()
     }
@@ -272,9 +296,9 @@ impl TextLlm {
         let PreparedTextRequest {
             text_request,
             generate_request,
-        } = self.processor.prepare(request)?;
+        } = self.processor.prepare_generation(request)?;
 
-        let raw_stream = self.client.generate(generate_request).await?;
+        let raw_stream = self.client.generate(generate_request, &self.processor).await?;
         Ok((text_request, raw_stream))
     }
 

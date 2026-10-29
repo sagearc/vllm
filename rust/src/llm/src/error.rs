@@ -10,6 +10,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("operation `{operation}` is not supported by this engine client")]
     UnsupportedOperation { operation: &'static str },
+    /// Failure supplied by a generation backend; its adapter owns the error details.
+    #[error("generation backend failed: {source}")]
+    Backend {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("generate request `{request_id}` has an empty prompt_token_ids")]
     EmptyPromptTokenIds { request_id: String },
     #[error("engine-core error")]
