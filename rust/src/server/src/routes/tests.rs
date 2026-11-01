@@ -4657,36 +4657,40 @@ async fn health_endpoint_returns_503_after_engine_core_dead_sentinel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn load_endpoint_resets_when_stream_response_is_dropped() {
-    let (app, engine_task) = test_app_with_engine_handle().await;
+    for (uri, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "prompt": "hello", "stream": true}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 10, "stream": true}),
+        ),
+    ] {
+        let (app, engine_task) = test_app_with_engine_handle().await;
 
-    let response = app
-        .clone()
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "prompt": "hello",
-                        "stream": true
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
+        let response = app
+            .clone()
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(server_load(&app).await, 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(server_load(&app).await, 1);
 
-    drop(response);
-    tokio::task::yield_now().await;
-    engine_task.await.expect("mock engine task");
+        drop(response);
+        tokio::task::yield_now().await;
+        engine_task.await.expect("mock engine task");
 
-    assert_eq!(server_load(&app).await, 0);
+        assert_eq!(server_load(&app).await, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10720,6 +10724,56 @@ async fn anthropic_text_generation_reports_content_and_stop() {
         assert_eq!(body.get("stop_sequence"), Some(&serde_json::Value::Null));
         assert_eq!(body["usage"]["output_tokens"], text.len());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_rejects_invalid_model_and_sampling_before_generation() {
+    let mut app = test_app().await;
+    for (field, value, status) in [
+        ("model", json!("missing-model"), StatusCode::NOT_FOUND),
+        ("temperature", json!(-1), StatusCode::BAD_REQUEST),
+        ("top_p", json!(1.1), StatusCode::BAD_REQUEST),
+        ("stop_sequences", json!([""]), StatusCode::BAD_REQUEST),
+    ] {
+        let mut request = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hi"}]});
+        request[field] = value;
+        let (actual, body) = post_json(&mut app, "/v1/messages", request).await;
+        assert_eq!(actual, status, "{body}");
+        assert_eq!(body["type"], "error");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_assistant_prefix_count_matches_generation_without_echo() {
+    let (mut app, engine_task) = test_app_with_stream_output_specs(vec![(
+        bytes_to_token_ids(b"continuation"),
+        Some(EngineCoreFinishReason::Length),
+    )])
+    .await;
+    let input = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "messages": [
+        {"role": "user", "content": "Complete"},
+        {"role": "assistant", "content": "prefix"}
+    ]});
+    let (status, count) = post_json(&mut app, "/v1/messages/count_tokens", input.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{count}");
+    // The fixture renderer appends `assistant:` only for a new turn.
+    assert_eq!(
+        count["input_tokens"],
+        b"user: Complete\nassistant: prefix\n".len()
+    );
+    let mut generation = input;
+    generation["max_tokens"] = json!(20);
+    let (status, response) = post_json(&mut app, "/v1/messages", generation).await;
+    engine_task.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["usage"]["input_tokens"], count["input_tokens"]);
+    assert_eq!(
+        response["content"],
+        json!([{"type": "text", "text": "continuation"}])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

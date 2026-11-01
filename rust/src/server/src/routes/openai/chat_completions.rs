@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 pub(crate) mod convert;
-pub(crate) mod types;
+mod types;
 mod validate;
 
 use std::convert::Infallible;
@@ -29,7 +29,7 @@ use vllm_llm::WeightVersionSpan;
 
 use self::convert::{ResponseOptions, prepare_chat_request};
 pub(crate) use self::types::ChatCompletionRequest;
-use crate::config::{ApiServerOptions, OutputLogConfig};
+use crate::config::ApiServerOptions;
 use crate::error::{ApiError, bail_server_error, chat_submit_error, engine_error, server_error};
 use crate::lora::LoraModelResolution;
 use crate::routes::openai::chat_completions::types::{
@@ -48,7 +48,7 @@ use crate::routes::openai::utils::types::{
 use crate::routes::openai::utils::usage::ContinuousUsage;
 use crate::routes::openai::utils::validate_max_output_tokens;
 use crate::routes::openai::utils::validated_json::ValidatedJson;
-use crate::routes::output_log::{LoggedOutput, chat_output_text};
+use crate::routes::output_log::{LoggedOutput, StreamDeltaLog, chat_output_text};
 use crate::state::AppState;
 use crate::utils::{ResolvedRequestContext, resolve_request_context, sse_response, unix_timestamp};
 
@@ -67,43 +67,22 @@ pub async fn chat_completions(
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    let keep_alive = state.api_server_options.sse_keep_alive_interval;
-    match create_chat_completion(state, headers, body).await {
-        Ok(ChatCompletionOutput::Full(response)) => Json(response).into_response(),
-        Ok(ChatCompletionOutput::Stream(stream)) => {
-            sse_response(chat_completion_sse_stream(stream), keep_alive)
-        }
-        Err(error) => error.into_response(),
-    }
-}
-
-pub(crate) enum ChatCompletionOutput<S> {
-    Full(Box<ChatCompletionResponse>),
-    Stream(S),
-}
-
-/// Execute a typed chat request before protocol-specific HTTP serialization.
-pub(crate) async fn create_chat_completion(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: ChatCompletionRequest,
-) -> Result<
-    ChatCompletionOutput<
-        impl Stream<Item = Result<ChatCompletionStreamResponse, ApiError>> + Send + 'static,
-    >,
-    ApiError,
-> {
     let stream = body.stream;
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let requested_model = body.model.as_deref().filter(|model| !model.is_empty());
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
 
-    let prepared = prepare_chat_request(body, &lora_resolution, request_context)?;
-    validate_max_output_tokens(
+    let prepared = match prepare_chat_request(body, &lora_resolution, request_context) {
+        Ok(prepared) => prepared,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = validate_max_output_tokens(
         "max_completion_tokens",
         prepared.chat_request.sampling_params.max_tokens,
         state.chat.engine_core_client().max_model_len(),
-    )?;
+    ) {
+        return error.into_response();
+    }
     let request_span = tracing::info_span!(
         "chat_completions",
         request_id = %prepared.request_id,
@@ -116,12 +95,13 @@ pub(crate) async fn create_chat_completion(
     // is configured to count them.
     let count_reasoning_tokens = state.chat.reasoning_parser_name().is_some();
 
-    let mut chat_stream = state
-        .chat
-        .chat(prepared.chat_request)
-        .instrument(request_span.clone())
-        .await
-        .map_err(|error| chat_submit_error("failed to submit chat request", error))?;
+    let mut chat_stream =
+        match state.chat.chat(prepared.chat_request).instrument(request_span.clone()).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return chat_submit_error("failed to submit chat request", error).into_response();
+            }
+        };
 
     if stream {
         let prompt_text = chat_stream.take_prompt_text();
@@ -135,11 +115,11 @@ pub(crate) async fn create_chat_completion(
             count_reasoning_tokens,
             prepared.options,
         );
-        Ok(ChatCompletionOutput::Stream(
-            chunk_stream.instrument(request_span),
-        ))
+        let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
+
+        sse_response(sse_stream, api_server_options.sse_keep_alive_interval)
     } else {
-        let response = collect_chat_completion(
+        let response = match collect_chat_completion(
             chat_stream,
             prepared.request_id,
             prepared.response_model,
@@ -149,9 +129,13 @@ pub(crate) async fn create_chat_completion(
             prepared.options,
         )
         .instrument(request_span.clone())
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => return error.into_response(),
+        };
 
-        Ok(ChatCompletionOutput::Full(Box::new(response)))
+        Json(response).into_response()
     }
 }
 
@@ -438,7 +422,7 @@ async fn chat_completion_chunk_stream(
                     include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
                 if include_delta {
                     if let Some(delta_log) = delta_log.as_mut() {
-                        delta_log.current.push_block_delta(kind, &delta);
+                        delta_log.block_delta(kind, &delta);
                     }
                     if let Some(pending_chunk) = pending_chunk.as_mut() {
                         pending_chunk.push_block_delta(kind, delta);
@@ -519,7 +503,7 @@ async fn chat_completion_chunk_stream(
             }
             Ok(ChatEvent::ToolCallArgumentsDelta { index, delta }) => {
                 if let Some(delta_log) = delta_log.as_mut() {
-                    delta_log.current.tool_arguments.push_str(&delta);
+                    delta_log.tool_arguments(&delta);
                 }
                 let tool_index = index as u32;
                 if let Some(pending_chunk) = pending_chunk.as_mut() {
@@ -644,114 +628,6 @@ fn usage_chunk(
     chunk.usage = Some(usage);
     chunk.metrics = metrics.map(Into::into);
     chunk
-}
-
-/// Visible output of one decoded chat update, logged as one delta line by
-/// `--enable-log-outputs`.
-#[derive(Debug, Default)]
-struct UpdateOutput {
-    content: String,
-    reasoning: String,
-    tool_arguments: String,
-}
-
-impl UpdateOutput {
-    /// Record one visible text or reasoning block delta.
-    fn push_block_delta(&mut self, kind: AssistantBlockKind, delta: &str) {
-        match kind {
-            AssistantBlockKind::Text => self.content.push_str(delta),
-            AssistantBlockKind::Reasoning => self.reasoning.push_str(delta),
-            AssistantBlockKind::ToolCall => {
-                unreachable!("tool calls must flow through dedicated tool-call events")
-            }
-        }
-    }
-
-    /// Append output released after this update ended.
-    fn append(&mut self, other: Self) {
-        self.content.push_str(&other.content);
-        self.reasoning.push_str(&other.reasoning);
-        self.tool_arguments.push_str(&other.tool_arguments);
-    }
-
-    /// Describe the update like Python: content, `[reasoning: ...]` and
-    /// `[tool_calls: <arguments>]` joined by spaces. `None` when nothing was
-    /// visible.
-    fn describe(&self) -> Option<String> {
-        let mut parts = Vec::new();
-        if !self.content.is_empty() {
-            parts.push(self.content.clone());
-        }
-        if !self.reasoning.is_empty() {
-            parts.push(format!("[reasoning: {}]", self.reasoning));
-        }
-        if !self.tool_arguments.is_empty() {
-            parts.push(format!("[tool_calls: {}]", self.tool_arguments));
-        }
-        (!parts.is_empty()).then(|| parts.join(" "))
-    }
-}
-
-/// Per-update delta logging of one chat stream (`--enable-log-deltas`).
-///
-/// Each update is held until the next one ends or the stream finishes, so the
-/// last delta line carries the finish reason: `vllm-chat` emits `Done` after
-/// the last update's `LogprobsDelta`, and a parser may release held-back output
-/// in between, which belongs to that last update.
-#[derive(Debug)]
-struct StreamDeltaLog {
-    /// Where the deltas are logged.
-    log_outputs: OutputLogConfig,
-    /// Output of the update in progress.
-    current: UpdateOutput,
-    /// The last ended update and its output token IDs.
-    ended: Option<(UpdateOutput, Vec<u32>)>,
-}
-
-impl StreamDeltaLog {
-    fn new(log_outputs: OutputLogConfig) -> Self {
-        Self {
-            log_outputs,
-            current: UpdateOutput::default(),
-            ended: None,
-        }
-    }
-
-    /// End the update in progress, whose output token IDs are `token_ids`,
-    /// and log the update before it.
-    fn end_update(&mut self, token_ids: &[u32]) {
-        if let Some((output, token_ids)) = self.ended.take()
-            && let Some(delta) = output.describe()
-        {
-            self.log_outputs.log(LoggedOutput::StreamDelta, &delta, Some(&token_ids), None);
-        }
-        self.ended = Some((std::mem::take(&mut self.current), token_ids.to_vec()));
-    }
-
-    /// Log the held update, with the stream's finish reason when it finished.
-    fn finish(&mut self, finish_reason: Option<&str>) {
-        let (mut output, token_ids) = match self.ended.take() {
-            Some((output, token_ids)) => (output, Some(token_ids)),
-            None => (UpdateOutput::default(), None),
-        };
-        output.append(std::mem::take(&mut self.current));
-        if let Some(delta) = output.describe() {
-            self.log_outputs.log(
-                LoggedOutput::StreamDelta,
-                &delta,
-                token_ids.as_deref(),
-                finish_reason,
-            );
-        }
-    }
-}
-
-impl Drop for StreamDeltaLog {
-    /// A stream that fails or is dropped before `Done` still logs the output
-    /// already sent to the client.
-    fn drop(&mut self) {
-        self.finish(None);
-    }
 }
 
 /// One in-flight chat-completions SSE chunk being assembled at the route layer.
@@ -1085,7 +961,7 @@ mod tests {
 
     use super::{
         ApiServerOptions, ChatCompletionStreamResponse, ResponseOptions, StreamResponseEnvelope,
-        UpdateOutput, block_delta_chunk, chat_completion_chunk_stream, final_chunk,
+        block_delta_chunk, chat_completion_chunk_stream, final_chunk,
     };
 
     /// Terminal usage with the given engine-level counts and zero reasoning tokens.
@@ -1136,28 +1012,6 @@ mod tests {
         assert_eq!(
             chunk.choices[0].delta.reasoning.as_deref(),
             Some("thinking")
-        );
-    }
-
-    #[test]
-    fn update_output_describes_parts_and_appends_released_output() {
-        let mut update = UpdateOutput::default();
-        assert_eq!(update.describe(), None);
-        update.push_block_delta(AssistantBlockKind::Reasoning, "Need tool.");
-        update.push_block_delta(AssistantBlockKind::Text, "Hello");
-        update.tool_arguments.push_str("{\"city\": ");
-        assert_eq!(
-            update.describe().as_deref(),
-            Some("Hello [reasoning: Need tool.] [tool_calls: {\"city\": ]")
-        );
-
-        // Output a parser releases at finish continues the same parts.
-        let mut released = UpdateOutput::default();
-        released.push_block_delta(AssistantBlockKind::Text, "<tool_ca");
-        update.append(released);
-        assert_eq!(
-            update.describe().as_deref(),
-            Some("Hello<tool_ca [reasoning: Need tool.] [tool_calls: {\"city\": ]")
         );
     }
 
