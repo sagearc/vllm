@@ -151,41 +151,60 @@ impl CountTokensRequest {
     }
 }
 
-pub struct AnthropicError(ApiError);
-
-impl From<ApiError> for AnthropicError {
-    fn from(error: ApiError) -> Self {
-        Self(error)
-    }
+#[derive(Debug, serde::Serialize)]
+struct ErrorResponse {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    error: ErrorDetail,
 }
 
-impl IntoResponse for AnthropicError {
-    fn into_response(self) -> Response {
-        (self.0.status_code(), Json(error_body(&self.0))).into_response()
-    }
+#[derive(Debug, serde::Serialize)]
+struct ErrorDetail {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: String,
 }
 
-fn error_body(error: &ApiError) -> serde_json::Value {
-    let kind = match error.status_code().as_u16() {
-        400 => "invalid_request_error",
-        404 => "not_found_error",
-        409 => "conflict_error",
-        503 => "overloaded_error",
-        _ => "api_error",
+fn error_body(error: ApiError) -> ErrorResponse {
+    let (kind, message) = match error {
+        ApiError::InvalidRequest { message, .. } | ApiError::JsonParseError { message } => {
+            ("invalid_request_error", message)
+        }
+        ApiError::ModelNotFound { model } => (
+            "not_found_error",
+            format!("The model `{model}` does not exist."),
+        ),
+        ApiError::NotFound { message } => ("not_found_error", message),
+        ApiError::Conflict { message } => ("conflict_error", message),
+        ApiError::ServiceUnavailable { message } => ("overloaded_error", message),
+        ApiError::ServerError { message } => ("api_error", message),
     };
-    json!({"type": "error", "error": {"type": kind, "message": error.to_error_response().error.message}})
+    ErrorResponse {
+        kind: "error",
+        error: ErrorDetail { kind, message },
+    }
+}
+
+fn error_response(error: ApiError) -> Response {
+    (error.status_code(), Json(error_body(error))).into_response()
 }
 
 pub async fn count_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<ValidatedJson<CountTokensRequest>, ApiError>,
-) -> Result<Json<CountTokensResponse>, AnthropicError> {
-    Ok(Json(
-        MessagesLlm::new(&state)
-            .count_tokens(body?.0, resolve_request_context(&headers, None))
-            .await?,
-    ))
+) -> Response {
+    let body = match body {
+        Ok(body) => body.0,
+        Err(error) => return error_response(error),
+    };
+    match MessagesLlm::new(&state)
+        .count_tokens(body, resolve_request_context(&headers, None))
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(error),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -243,19 +262,24 @@ pub async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<ValidatedJson<MessagesRequest>, ApiError>,
-) -> Result<Response, AnthropicError> {
+) -> Response {
+    let body = match body {
+        Ok(body) => body.0,
+        Err(error) => return error_response(error),
+    };
     match MessagesLlm::new(&state)
-        .create(body?.0, resolve_request_context(&headers, None))
-        .await?
+        .create(body, resolve_request_context(&headers, None))
+        .await
     {
-        MessagesOutput::Full(response) => Ok(Json(response).into_response()),
-        MessagesOutput::Stream(events) => Ok(crate::utils::sse_response(
+        Ok(MessagesOutput::Full(response)) => Json(response).into_response(),
+        Ok(MessagesOutput::Stream(events)) => crate::utils::sse_response(
             events.map(|event| {
                 let body = match event {
                     Ok(event) => {
                         serde_json::to_value(event).expect("Messages event must serialize")
                     }
-                    Err(error) => error_body(&error),
+                    Err(error) => serde_json::to_value(error_body(error))
+                        .expect("Messages error must serialize"),
                 };
                 Ok::<_, std::convert::Infallible>(
                     axum::response::sse::Event::default()
@@ -265,7 +289,8 @@ pub async fn messages(
                 )
             }),
             state.api_server_options.sse_keep_alive_interval,
-        )),
+        ),
+        Err(error) => error_response(error),
     }
 }
 
@@ -406,6 +431,7 @@ pub(crate) struct MessagesUsage {
 
 fn stop_reason(finish: &FinishReason) -> Result<(&'static str, Option<&str>), ApiError> {
     match finish {
+        FinishReason::Error(error) => Err(crate::error::engine_error(error.as_deref())),
         FinishReason::Length => Ok(("max_tokens", None)),
         FinishReason::Stop(Some(StopReason::Text(text))) => Ok(("stop_sequence", Some(text))),
         FinishReason::Stop(_) => Ok(("end_turn", None)),
@@ -425,5 +451,47 @@ fn usage(usage: TokenUsage, include_cache: bool) -> MessagesUsage {
         output_tokens: usage.output_token_count,
         cache_read_input_tokens: include_cache.then_some(cached),
         cache_creation_input_tokens: include_cache.then_some(created),
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn anthropic_error_payloads_preserve_semantics() {
+        for (error, kind, message) in [
+            (
+                ApiError::invalid_request("bad input", Some("messages")),
+                "invalid_request_error",
+                "bad input",
+            ),
+            (
+                ApiError::json_parse_error("bad JSON"),
+                "invalid_request_error",
+                "bad JSON",
+            ),
+            (
+                ApiError::model_not_found("missing"),
+                "not_found_error",
+                "The model `missing` does not exist.",
+            ),
+            (
+                ApiError::not_found("missing resource"),
+                "not_found_error",
+                "missing resource",
+            ),
+            (ApiError::conflict("busy"), "conflict_error", "busy"),
+            (
+                ApiError::service_unavailable("paused"),
+                "overloaded_error",
+                "paused",
+            ),
+            (ApiError::server_error("failed"), "api_error", "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(error_body(error)).unwrap(),
+                json!({"type":"error","error":{"type":kind,"message":message}})
+            );
+        }
     }
 }
