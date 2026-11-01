@@ -10762,6 +10762,8 @@ async fn anthropic_text_generation_reports_content_and_stop() {
         .await;
         engine_task.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["role"], "assistant");
+        assert!(body.get("message").is_none(), "{body}");
         assert_eq!(body["content"], json!([{"type": "text", "text": text}]));
         assert_eq!(body["stop_reason"], expected);
         assert_eq!(body.get("stop_sequence"), Some(&serde_json::Value::Null));
@@ -10856,6 +10858,9 @@ async fn anthropic_stream_preserves_text_order_and_terminal_usage() {
         .iter()
         .map(|value| serde_json::from_str(value).unwrap())
         .collect();
+    assert_eq!(events[0]["message"]["role"], "assistant");
+    assert_eq!(events[0]["message"]["content"], json!([]));
+    assert!(events[0]["message"].get("message").is_none());
     let types: Vec<_> = events.iter().map(|event| event["type"].as_str().unwrap()).collect();
     assert_eq!(
         types,
