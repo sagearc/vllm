@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+mod stream;
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -131,22 +133,20 @@ impl From<ApiError> for AnthropicError {
 
 impl IntoResponse for AnthropicError {
     fn into_response(self) -> Response {
-        let status = self.0.status_code();
-        let kind = match status.as_u16() {
-            400 => "invalid_request_error",
-            404 => "not_found_error",
-            409 => "conflict_error",
-            503 => "overloaded_error",
-            _ => "api_error",
-        };
-        (
-            status,
-            Json(json!({"type": "error", "error": {
-                "type": kind, "message": self.0.to_error_response().error.message,
-            }})),
-        )
-            .into_response()
+        (self.0.status_code(), Json(error_body(&self.0))).into_response()
     }
+}
+
+fn error_body(error: &ApiError) -> serde_json::Value {
+    let kind = match error.status_code().as_u16() {
+        400 => "invalid_request_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        503 => "overloaded_error",
+        _ => "api_error",
+    };
+    json!({"type": "error", "error": {"type": kind,
+        "message": error.to_error_response().error.message}})
 }
 
 pub async fn count_tokens(
@@ -190,10 +190,14 @@ impl Normalizable for MessagesRequest {}
 
 impl MessagesRequest {
     fn into_chat(self) -> Result<ChatCompletionRequest, ApiError> {
-        if self.stream == Some(true) {
-            return Err(invalid_request!("Streaming Messages is not supported yet"));
-        }
         let mut request = self.input.into_chat()?;
+        request.stream = self.stream.unwrap_or(false);
+        if request.stream {
+            request.stream_options = Some(crate::routes::openai::utils::types::StreamOptions {
+                include_usage: Some(true),
+                continuous_usage_stats: Some(true),
+            });
+        }
         request.max_completion_tokens = Some(self.max_tokens);
         request.temperature = self.temperature;
         request.top_p = self.top_p;
@@ -212,10 +216,15 @@ pub async fn messages(
     body: Result<ValidatedJson<MessagesRequest>, ApiError>,
 ) -> Result<Response, AnthropicError> {
     let request = body?.0.into_chat()?;
-    let ChatCompletionOutput::Full(response) =
-        create_chat_completion(state, headers, request).await?
-    else {
-        unreachable!("streaming rejected during request conversion");
+    let keep_alive = state.api_server_options.sse_keep_alive_interval;
+    let response = match create_chat_completion(state, headers, request).await? {
+        ChatCompletionOutput::Full(response) => response,
+        ChatCompletionOutput::Stream(stream) => {
+            return Ok(crate::utils::sse_response(
+                stream::messages_stream(stream),
+                keep_alive,
+            ));
+        }
     };
     let choice = &response.choices[0];
     let (reason, sequence) =
