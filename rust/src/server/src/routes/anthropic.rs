@@ -116,7 +116,7 @@ enum CustomToolType {
     Custom,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum MessagesToolChoice {
     Auto {
