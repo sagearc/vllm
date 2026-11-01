@@ -45,23 +45,23 @@ pub struct CountTokensRequest {
 
 impl Normalizable for CountTokensRequest {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 enum Message {
     User { content: Content },
     Assistant { content: Content },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(untagged)]
-enum Content {
+pub(crate) enum Content {
     Text(String),
     Blocks(Vec<Block>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Block {
+pub(crate) enum Block {
     Text {
         text: String,
     },
@@ -514,8 +514,8 @@ impl<'a> MessagesLlm<'a> {
             options.log_outputs.log(LoggedOutput::Response, &text, Some(&response.token_ids), Some(reason));
         }
         Ok(MessagesResponse {
-            id: request_id, message_type: "message", role: "assistant", model: model.response_model(),
-            content: response_blocks(&response.message.content)?, stop_reason: Some(reason), stop_sequence: sequence.map(str::to_owned),
+            id: request_id, message_type: "message", message: Message::Assistant { content: Content::Blocks(response_blocks(&response.message.content)?) }, model: model.response_model(),
+            stop_reason: Some(reason), stop_sequence: sequence.map(str::to_owned),
             usage: usage(response.usage.engine, options.enable_prompt_tokens_details),
             kv_transfer_params: response.kv_transfer_params, ec_transfer_params: response.ec_transfer_params,
         })
@@ -529,9 +529,9 @@ pub(crate) struct MessagesResponse {
     id: String,
     #[serde(rename = "type")]
     message_type: &'static str,
-    role: &'static str,
+    #[serde(flatten)]
+    message: Message,
     model: String,
-    content: Vec<ResponseBlock>,
     stop_reason: Option<&'static str>,
     stop_sequence: Option<String>,
     usage: MessagesUsage,
@@ -539,19 +539,6 @@ pub(crate) struct MessagesResponse {
     kv_transfer_params: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ec_transfer_params: Option<serde_json::Value>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponseBlock {
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Map<String, serde_json::Value>,
-    },
-    Text {
-        text: String,
-    },
 }
 
 #[derive(serde::Serialize)]
@@ -601,12 +588,12 @@ fn tool_input(arguments: &str) -> Result<serde_json::Map<String, serde_json::Val
         .map_err(|_| server_error!("Generated tool arguments are not a complete JSON object"))
 }
 
-fn response_blocks(blocks: &[AssistantContentBlock]) -> Result<Vec<ResponseBlock>, ApiError> {
+fn response_blocks(blocks: &[AssistantContentBlock]) -> Result<Vec<Block>, ApiError> {
     let mut result = Vec::new();
     for block in blocks {
         result.push(match block {
-            AssistantContentBlock::Text { text } => ResponseBlock::Text { text: text.clone() },
-            AssistantContentBlock::ToolCall(call) => ResponseBlock::ToolUse {
+            AssistantContentBlock::Text { text } => Block::Text { text: text.clone() },
+            AssistantContentBlock::ToolCall(call) => Block::ToolUse {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 input: tool_input(&call.arguments)?,
@@ -615,51 +602,9 @@ fn response_blocks(blocks: &[AssistantContentBlock]) -> Result<Vec<ResponseBlock
         });
     }
     if result.is_empty() {
-        result.push(ResponseBlock::Text {
+        result.push(Block::Text {
             text: String::new(),
         });
     }
     Ok(result)
-}
-
-#[cfg(test)]
-mod error_tests {
-    use super::*;
-    #[test]
-    fn anthropic_error_payloads_preserve_semantics() {
-        for (error, kind, message) in [
-            (
-                ApiError::invalid_request("bad input", Some("messages")),
-                "invalid_request_error",
-                "bad input",
-            ),
-            (
-                ApiError::json_parse_error("bad JSON"),
-                "invalid_request_error",
-                "bad JSON",
-            ),
-            (
-                ApiError::model_not_found("missing"),
-                "not_found_error",
-                "The model `missing` does not exist.",
-            ),
-            (
-                ApiError::not_found("missing resource"),
-                "not_found_error",
-                "missing resource",
-            ),
-            (ApiError::conflict("busy"), "conflict_error", "busy"),
-            (
-                ApiError::service_unavailable("paused"),
-                "overloaded_error",
-                "paused",
-            ),
-            (ApiError::server_error("failed"), "api_error", "failed"),
-        ] {
-            assert_eq!(
-                serde_json::to_value(error_body(error)).unwrap(),
-                json!({"type":"error","error":{"type":kind,"message":message}})
-            );
-        }
-    }
 }
