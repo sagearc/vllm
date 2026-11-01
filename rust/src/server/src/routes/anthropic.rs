@@ -11,7 +11,6 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::json;
 use validator::Validate;
 
 use crate::error::{ApiError, chat_submit_error, invalid_request, server_error, text_submit_error};
@@ -457,6 +456,7 @@ fn usage(usage: TokenUsage, include_cache: bool) -> MessagesUsage {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn anthropic_error_payloads_preserve_semantics() {
         for (error, kind, message) in [
