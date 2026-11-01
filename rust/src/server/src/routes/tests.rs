@@ -10822,3 +10822,68 @@ async fn anthropic_stream_error_does_not_report_success() {
             .any(|event| event["type"] == "message_stop" || event["type"] == "message_delta")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_tools_use_existing_parser_in_both_response_modes() {
+    for stream in [false, true] {
+        let mut output = weather_tool_call_output_specs();
+        output[0].0 = token_ids("<think></think>");
+        let (mut app, engine_task) = test_app_with_backend_and_stream_output_specs(
+            Arc::new(FakeChatBackend::with_model_id("Qwen/Qwen3-0.6B")),
+            output,
+        )
+        .await;
+        let response = app.call(Request::builder().method("POST").uri("/v1/messages")
+            .header("content-type", "application/json").body(Body::from(json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 100, "stream": stream,
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+            }).to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        engine_task.await.unwrap();
+        if stream {
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            let events: Vec<serde_json::Value> = sse_data_payloads(&text)
+                .iter()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            let call = events.iter().find(|e| e["content_block"]["type"] == "tool_use").unwrap();
+            assert_eq!(call["content_block"]["name"], "get_weather");
+            let args: String =
+                events.iter().filter_map(|e| e["delta"]["partial_json"].as_str()).collect();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+                json!({"city": "Paris"})
+            );
+            assert!(events.iter().any(|e| e["delta"]["stop_reason"] == "tool_use"));
+        } else {
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["stop_reason"], "tool_use");
+            let call = body["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["type"] == "tool_use")
+                .unwrap();
+            assert_eq!(call["input"], json!({"city": "Paris"}));
+            assert_eq!(call["name"], "get_weather");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_counts_tool_history_without_output_parser() {
+    let mut app = test_app().await;
+    let (status, body) = post_json(&mut app, "/v1/messages/count_tokens", json!({
+        "model": "Qwen/Qwen1.5-0.5B-Chat",
+        "tools": [{"name": "weather", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "call1", "name": "weather", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call1", "content": "sunny"}]}]
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["input_tokens"].as_u64().unwrap() > 0);
+}

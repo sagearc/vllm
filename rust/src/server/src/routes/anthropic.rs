@@ -17,7 +17,10 @@ use crate::error::{ApiError, chat_submit_error, invalid_request, server_error, t
 use crate::routes::openai::chat_completions::{
     ChatCompletionOutput, ChatCompletionRequest, create_chat_completion, lower_chat_request,
 };
-use crate::routes::openai::utils::types::{ChatMessage, ContentPart, MessageContent, Normalizable};
+use crate::routes::openai::utils::types::{
+    ChatMessage, ContentPart, Function, FunctionCallResponse, FunctionChoice, MessageContent,
+    Normalizable, Tool, ToolCall, ToolChoice, ToolChoiceValue,
+};
 use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::state::AppState;
 use crate::utils::resolve_request_context;
@@ -27,7 +30,9 @@ use crate::utils::resolve_request_context;
 pub struct CountTokensRequest {
     model: String,
     messages: Vec<Message>,
-    system: Option<TextContent>,
+    system: Option<Content>,
+    tools: Option<Vec<CustomTool>>,
+    tool_choice: Option<MessagesToolChoice>,
 }
 
 impl Normalizable for CountTokensRequest {}
@@ -35,51 +40,148 @@ impl Normalizable for CountTokensRequest {}
 #[derive(Debug, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 enum Message {
-    User { content: TextContent },
-    Assistant { content: TextContent },
+    User { content: Content },
+    Assistant { content: Content },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum TextContent {
+enum Content {
     Text(String),
-    Blocks(Vec<TextBlock>),
+    Blocks(Vec<Block>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Block {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Map<String, serde_json::Value>,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Option<Content>,
+        #[serde(rename = "is_error")]
+        _is_error: Option<bool>,
+    },
+}
+
+impl Content {
+    fn blocks(self) -> Vec<Block> {
+        match self {
+            Self::Text(text) => vec![Block::Text { text }],
+            Self::Blocks(blocks) => blocks,
+        }
+    }
+
+    fn into_text(self, separator: &str) -> Result<String, ApiError> {
+        self.blocks()
+            .into_iter()
+            .map(|block| match block {
+                Block::Text { text } => Ok(text),
+                _ => Err(invalid_request!("Only text blocks are supported here")),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|parts| parts.join(separator))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomTool {
+    name: String,
+    description: Option<String>,
+    input_schema: serde_json::Map<String, serde_json::Value>,
+    strict: Option<bool>,
+    defer_loading: Option<bool>,
+    #[serde(rename = "type")]
+    _kind: Option<CustomToolType>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CustomToolType {
+    Custom,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-enum TextBlock {
-    Text { text: String },
+enum MessagesToolChoice {
+    Auto {
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        disable_parallel_tool_use: Option<bool>,
+    },
+    None,
+    Tool {
+        name: String,
+        disable_parallel_tool_use: Option<bool>,
+    },
 }
 
-impl TextContent {
-    fn into_content(self) -> MessageContent {
-        match self {
-            Self::Text(text) => MessageContent::Text(text),
-            Self::Blocks(blocks) => {
-                let mut parts: Vec<_> = blocks
-                    .into_iter()
-                    .map(|TextBlock::Text { text }| ContentPart::Text { text })
-                    .collect();
-                if parts.len() == 1 {
-                    let ContentPart::Text { text } = parts.pop().unwrap() else {
-                        unreachable!()
-                    };
-                    MessageContent::Text(text)
-                } else {
-                    MessageContent::Parts(parts)
+impl Message {
+    fn append(self, messages: &mut Vec<ChatMessage>) -> Result<(), ApiError> {
+        let (assistant, content) = match self {
+            Self::User { content } => (false, content),
+            Self::Assistant { content } => (true, content),
+        };
+        let mut parts = Vec::new();
+        let mut calls = Vec::new();
+        for block in content.blocks() {
+            match block {
+                Block::Text { text } if !text.is_empty() => parts.push(ContentPart::Text { text }),
+                Block::Text { .. } => {}
+                Block::ToolUse { id, name, input } if assistant => calls.push(ToolCall {
+                    id,
+                    tool_type: "function".into(),
+                    function: FunctionCallResponse {
+                        name,
+                        arguments: Some(serde_json::Value::Object(input).to_string()),
+                    },
+                }),
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    _is_error: _,
+                } if !assistant => {
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tool_use_id,
+                        content: MessageContent::Text(
+                            content.map(|c| c.into_text("\n")).transpose()?.unwrap_or_default(),
+                        ),
+                    });
+                }
+                _ => {
+                    return Err(invalid_request!(
+                        "tool_use requires an assistant role and tool_result requires a user role"
+                    ));
                 }
             }
         }
-    }
-
-    fn into_text(self) -> String {
-        match self {
-            Self::Text(text) => text,
-            Self::Blocks(blocks) => {
-                blocks.into_iter().map(|TextBlock::Text { text }| text).collect()
-            }
+        let content = match parts.as_slice() {
+            [] => None,
+            [ContentPart::Text { text }] => Some(MessageContent::Text(text.clone())),
+            _ => Some(MessageContent::Parts(parts)),
+        };
+        if assistant {
+            messages.push(ChatMessage::Assistant {
+                content,
+                name: None,
+                reasoning: None,
+                tool_calls: (!calls.is_empty()).then_some(calls),
+            });
+        } else if let Some(content) = content {
+            messages.push(ChatMessage::User {
+                content,
+                name: None,
+            });
         }
+        Ok(())
     }
 }
 
@@ -90,7 +192,7 @@ impl CountTokensRequest {
         }
         let mut messages = Vec::new();
         if let Some(system) = self.system {
-            let text = system.into_text();
+            let text = system.into_text("")?;
             if !text.is_empty() {
                 messages.push(ChatMessage::System {
                     content: MessageContent::Text(text),
@@ -99,22 +201,69 @@ impl CountTokensRequest {
             }
         }
         for message in self.messages {
-            messages.push(match message {
-                Message::User { content } => ChatMessage::User {
-                    content: content.into_content(),
-                    name: None,
-                },
-                Message::Assistant { content } => ChatMessage::Assistant {
-                    content: Some(content.into_content()),
-                    name: None,
-                    reasoning: None,
-                    tool_calls: None,
-                },
-            });
+            message.append(&mut messages)?;
         }
+        let tools: Vec<_> = self
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| {
+                let CustomTool {
+                    name,
+                    description,
+                    mut input_schema,
+                    strict,
+                    defer_loading,
+                    _kind: _,
+                } = tool;
+                input_schema.entry("type".to_owned()).or_insert(json!("object"));
+                Tool {
+                    tool_type: "function".into(),
+                    defer_loading: None,
+                    function: Function {
+                        name,
+                        description,
+                        parameters: input_schema.into(),
+                        strict,
+                        defer_loading,
+                    },
+                }
+            })
+            .collect();
+        let (tool_choice, parallel) = match self.tool_choice {
+            None => (None, None),
+            Some(MessagesToolChoice::Auto {
+                disable_parallel_tool_use,
+            }) => (
+                Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+                disable_parallel_tool_use,
+            ),
+            Some(MessagesToolChoice::Any {
+                disable_parallel_tool_use,
+            }) => (
+                Some(ToolChoice::Value(ToolChoiceValue::Required)),
+                disable_parallel_tool_use,
+            ),
+            Some(MessagesToolChoice::None) => {
+                (Some(ToolChoice::Value(ToolChoiceValue::None)), None)
+            }
+            Some(MessagesToolChoice::Tool {
+                name,
+                disable_parallel_tool_use,
+            }) => (
+                Some(ToolChoice::Function {
+                    tool_type: "function".into(),
+                    function: FunctionChoice { name },
+                }),
+                disable_parallel_tool_use,
+            ),
+        };
         let mut request = ChatCompletionRequest {
             model: Some(self.model),
             messages,
+            tools: (!tools.is_empty()).then_some(tools),
+            tool_choice,
+            parallel_tool_calls: parallel.map(|disabled| !disabled),
             ..Default::default()
         };
         request.normalize();
@@ -227,14 +376,31 @@ pub async fn messages(
         }
     };
     let choice = &response.choices[0];
-    let (reason, sequence) =
-        stop_reason(choice.finish_reason.as_deref(), choice.stop_reason.as_ref())?;
-    if choice.message.reasoning.is_some() || !choice.message.tool_calls.is_empty() {
-        return Err(invalid_request!("Reasoning and tool output are not supported yet").into());
+    let (reason, sequence) = stop_reason(
+        choice.finish_reason.as_deref(),
+        choice.stop_reason.as_ref(),
+        !choice.message.tool_calls.is_empty(),
+        true,
+    )?;
+    if choice.message.reasoning.is_some() {
+        return Err(invalid_request!("Reasoning output is not supported yet").into());
+    }
+    let mut content = Vec::new();
+    if let Some(text) = &choice.message.content {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    for call in &choice.message.tool_calls {
+        content.push(
+            json!({"type": "tool_use", "id": call.id, "name": call.function.name,
+            "input": tool_input(call.function.arguments.as_deref().unwrap_or(""))?}),
+        );
+    }
+    if content.is_empty() {
+        content.push(json!({"type": "text", "text": ""}));
     }
     let mut message = json!({
         "id": response.id, "type": "message", "role": "assistant", "model": response.model,
-        "content": [{"type": "text", "text": choice.message.content.as_deref().unwrap_or("")}],
+        "content": content,
         "stop_reason": reason, "stop_sequence": sequence,
         "usage": usage(response.usage.as_ref()),
     });
@@ -250,11 +416,15 @@ pub async fn messages(
 fn stop_reason<'a>(
     finish: Option<&str>,
     stop: Option<&'a serde_json::Value>,
+    tool_used: bool,
+    tool_complete: bool,
 ) -> Result<(&'static str, Option<&'a str>), ApiError> {
     match finish {
         Some("length") => Ok(("max_tokens", None)),
-        Some("stop") => match stop.and_then(serde_json::Value::as_str) {
+        Some("stop" | "tool_calls") if tool_used && tool_complete => Ok(("tool_use", None)),
+        Some("stop" | "tool_calls") => match stop.and_then(serde_json::Value::as_str) {
             Some(text) => Ok(("stop_sequence", Some(text))),
+            None if tool_used => Ok(("tool_use", None)),
             None => Ok(("end_turn", None)),
         },
         _ => Err(server_error!("Generation did not complete successfully")),
@@ -275,4 +445,13 @@ fn usage(usage: Option<&crate::routes::openai::utils::types::Usage>) -> serde_js
         result["cache_creation_input_tokens"] = json!(created);
     }
     result
+}
+
+fn tool_input(arguments: &str) -> Result<serde_json::Value, ApiError> {
+    if arguments.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(arguments)
+        .map(serde_json::Value::Object)
+        .map_err(|_| server_error!("Generated tool arguments are not a complete JSON object"))
 }
