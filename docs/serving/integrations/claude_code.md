@@ -17,12 +17,15 @@ This means any model served by vLLM with proper tool calling support can act as 
 ## Rust frontend support
 
 The Rust frontend supports `/v1/messages/count_tokens` and streaming or non-streaming
-`/v1/messages` for text conversations with a top-level system prompt. Generation
+`/v1/messages` for text conversations with a top-level system prompt, custom tools, and text tool results. Generation
 accepts `max_tokens`, `temperature`, `top_p`, `top_k`, and `stop_sequences`.
-Custom client tools, tool choices, text tool results, and tool-call history are
-supported in counting and both generation modes. Malformed generated tool
-arguments produce an API error in non-streaming responses. Reasoning, images,
-server tools, and other request options are not supported yet.
+A final assistant message containing non-empty text and no tool calls is continued; token counting
+uses the same continuation prompt. Both endpoints reuse the shared chat renderer
+and tokenizer. Tool output reuses the configured chat tool parser. Counting tools does not require
+an output parser. Other content types and other request options return
+an error. Authentication uses the existing bearer-token configuration.
+Request failures use Anthropic error envelopes. Retryable engine rejections return
+HTTP 503; failures after streaming starts are delivered as SSE error events.
 Use `VLLM_USE_RUST_FRONTEND=0` for the Claude Code workflow below.
 
 ## Requirements

@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 mod stream;
-
+use futures::StreamExt as _;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::Json;
@@ -14,16 +15,23 @@ use serde_json::json;
 use validator::Validate;
 
 use crate::error::{ApiError, chat_submit_error, invalid_request, server_error, text_submit_error};
-use crate::routes::openai::chat_completions::{
-    ChatCompletionOutput, ChatCompletionRequest, create_chat_completion, lower_chat_request,
-};
+use crate::lora::LoraModelResolution;
 use crate::routes::openai::utils::types::{
-    ChatMessage, ContentPart, Function, FunctionCallResponse, FunctionChoice, MessageContent,
-    Normalizable, Tool, ToolCall, ToolChoice, ToolChoiceValue,
+    Normalizable, StringOrArray, validate_stop, validate_top_p_value,
 };
+use crate::routes::openai::utils::validate_max_output_tokens;
 use crate::routes::openai::utils::validated_json::ValidatedJson;
+use crate::routes::output_log::LoggedOutput;
 use crate::state::AppState;
-use crate::utils::resolve_request_context;
+use crate::utils::{ResolvedRequestContext, resolve_request_context};
+use tracing_futures::Instrument as _;
+use vllm_chat::{
+    AssistantContentBlock, AssistantMessageExt as _, AssistantToolCall, ChatContent,
+    ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatTool, ChatToolChoice, FinishReason,
+    GenerationPromptMode, ResolvedToolContext, SamplingParams,
+};
+use vllm_engine_core_client::protocol::output::StopReason;
+use vllm_llm::TokenUsage;
 
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -130,32 +138,29 @@ impl Message {
             Self::User { content } => (false, content),
             Self::Assistant { content } => (true, content),
         };
+        let mut blocks = Vec::new();
         let mut parts = Vec::new();
-        let mut calls = Vec::new();
         for block in content.blocks() {
             match block {
-                Block::Text { text } if !text.is_empty() => parts.push(ContentPart::Text { text }),
-                Block::Text { .. } => {}
-                Block::ToolUse { id, name, input } if assistant => calls.push(ToolCall {
-                    id,
-                    tool_type: "function".into(),
-                    function: FunctionCallResponse {
+                Block::Text { text } if assistant => {
+                    blocks.push(AssistantContentBlock::Text { text })
+                }
+                Block::Text { text } => parts.push(ChatContentPart::text(text)),
+                Block::ToolUse { id, name, input } if assistant => {
+                    blocks.push(AssistantContentBlock::ToolCall(AssistantToolCall {
+                        id,
                         name,
-                        arguments: Some(serde_json::Value::Object(input).to_string()),
-                    },
-                }),
+                        arguments: serde_json::Value::Object(input).to_string(),
+                    }))
+                }
                 Block::ToolResult {
                     tool_use_id,
                     content,
-                    _is_error: _,
-                } if !assistant => {
-                    messages.push(ChatMessage::Tool {
-                        tool_call_id: tool_use_id,
-                        content: MessageContent::Text(
-                            content.map(|c| c.into_text("\n")).transpose()?.unwrap_or_default(),
-                        ),
-                    });
-                }
+                    ..
+                } if !assistant => messages.push(ChatMessage::tool_response(
+                    content.map(|content| content.into_text("\n")).transpose()?.unwrap_or_default(),
+                    tool_use_id,
+                )),
                 _ => {
                     return Err(invalid_request!(
                         "tool_use requires an assistant role and tool_result requires a user role"
@@ -163,163 +168,181 @@ impl Message {
                 }
             }
         }
-        let content = match parts.as_slice() {
-            [] => None,
-            [ContentPart::Text { text }] => Some(MessageContent::Text(text.clone())),
-            _ => Some(MessageContent::Parts(parts)),
-        };
         if assistant {
-            messages.push(ChatMessage::Assistant {
-                content,
-                name: None,
-                reasoning: None,
-                tool_calls: (!calls.is_empty()).then_some(calls),
-            });
-        } else if let Some(content) = content {
-            messages.push(ChatMessage::User {
-                content,
-                name: None,
-            });
+            messages.push(ChatMessage::assistant_blocks(blocks));
+        } else if !parts.is_empty() {
+            let content = if parts.len() == 1 {
+                match parts.pop().unwrap() {
+                    ChatContentPart::Text { text } => ChatContent::Text(text),
+                    _ => unreachable!(),
+                }
+            } else {
+                ChatContent::Parts(parts)
+            };
+            messages.push(ChatMessage::user(content));
         }
         Ok(())
     }
 }
 
 impl CountTokensRequest {
-    fn into_chat(self) -> Result<ChatCompletionRequest, ApiError> {
+    fn into_chat(
+        self,
+        model: &LoraModelResolution,
+        ctx: ResolvedRequestContext,
+    ) -> Result<ChatRequest, ApiError> {
         if self.model.is_empty() || self.messages.is_empty() {
             return Err(invalid_request!("model and messages must be non-empty"));
         }
+        model.model_names.check(Some(&self.model))?;
         let mut messages = Vec::new();
         if let Some(system) = self.system {
-            let text = system.into_text("")?;
+            let text = match system {
+                Content::Text(text) => text,
+                Content::Blocks(blocks) => Content::Blocks(blocks.into_iter().filter(|block| !matches!(block, Block::Text { text } if text.starts_with("x-anthropic-billing-header"))).collect()).into_text("")?,
+            };
             if !text.is_empty() {
-                messages.push(ChatMessage::System {
-                    content: MessageContent::Text(text),
-                    name: None,
-                });
+                messages.push(ChatMessage::system(text));
             }
         }
         for message in self.messages {
             message.append(&mut messages)?;
         }
-        let tools: Vec<_> = self
+        let tools = self
             .tools
             .unwrap_or_default()
             .into_iter()
             .map(|tool| {
-                let CustomTool {
-                    name,
-                    description,
-                    mut input_schema,
-                    strict,
-                    defer_loading,
-                    _kind: _,
-                } = tool;
-                input_schema.entry("type".to_owned()).or_insert(json!("object"));
-                Tool {
-                    tool_type: "function".into(),
-                    defer_loading: None,
-                    function: Function {
-                        name,
-                        description,
-                        parameters: input_schema.into(),
-                        strict,
-                        defer_loading,
-                    },
+                let mut parameters = tool.input_schema;
+                parameters.entry("type".to_owned()).or_insert(json!("object"));
+                ChatTool {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: parameters.into(),
+                    strict: tool.strict,
+                    defer_loading: tool.defer_loading,
                 }
             })
             .collect();
-        let (tool_choice, parallel) = match self.tool_choice {
-            None => (None, None),
+        let (choice, parallel) = match self.tool_choice {
+            None => (None, true),
+            Some(MessagesToolChoice::None) => (Some(ChatToolChoice::None), true),
             Some(MessagesToolChoice::Auto {
                 disable_parallel_tool_use,
             }) => (
-                Some(ToolChoice::Value(ToolChoiceValue::Auto)),
-                disable_parallel_tool_use,
+                Some(ChatToolChoice::Auto),
+                !disable_parallel_tool_use.unwrap_or(false),
             ),
             Some(MessagesToolChoice::Any {
                 disable_parallel_tool_use,
             }) => (
-                Some(ToolChoice::Value(ToolChoiceValue::Required)),
-                disable_parallel_tool_use,
+                Some(ChatToolChoice::Required),
+                !disable_parallel_tool_use.unwrap_or(false),
             ),
-            Some(MessagesToolChoice::None) => {
-                (Some(ToolChoice::Value(ToolChoiceValue::None)), None)
-            }
             Some(MessagesToolChoice::Tool {
                 name,
                 disable_parallel_tool_use,
             }) => (
-                Some(ToolChoice::Function {
-                    tool_type: "function".into(),
-                    function: FunctionChoice { name },
-                }),
-                disable_parallel_tool_use,
+                Some(ChatToolChoice::Function { name }),
+                !disable_parallel_tool_use.unwrap_or(false),
             ),
         };
-        let mut request = ChatCompletionRequest {
-            model: Some(self.model),
+        let tool_context = ResolvedToolContext::new(&messages, tools, choice, parallel)
+            .map_err(|error| chat_submit_error("failed to resolve Messages tools", error))?;
+        let continuation = matches!(messages.last(), Some(ChatMessage::Assistant { content })
+            if !content.iter().any(|b| matches!(b, AssistantContentBlock::ToolCall(_))) && content.iter().any(|b| matches!(b, AssistantContentBlock::Text { text } if !text.is_empty())));
+        Ok(ChatRequest {
+            request_id: format!("msg_{}", ctx.request_id),
             messages,
-            tools: (!tools.is_empty()).then_some(tools),
-            tool_choice,
-            parallel_tool_calls: parallel.map(|disabled| !disabled),
-            ..Default::default()
-        };
-        request.normalize();
-        request.validate().map_err(|error| invalid_request!("{error}"))?;
-        Ok(request)
+            sampling_params: SamplingParams::default(),
+            chat_options: ChatOptions {
+                generation_prompt_mode: if continuation {
+                    GenerationPromptMode::ContinueFinalAssistant
+                } else {
+                    GenerationPromptMode::StartNewAssistant
+                },
+                ..Default::default()
+            },
+            tool_context,
+            decode_options: Default::default(),
+            intermediate: false,
+            prompt_truncation: None,
+            priority: ctx.priority.unwrap_or(0),
+            documents: None,
+            cache_salt: None,
+            add_special_tokens: false,
+            data_parallel_rank: ctx.data_parallel_rank,
+            session_id: ctx.session_id,
+            lora_request: model.lora_request.clone(),
+            return_prompt_text: false,
+        })
     }
 }
 
-pub struct AnthropicError(ApiError);
-
-impl From<ApiError> for AnthropicError {
-    fn from(error: ApiError) -> Self {
-        Self(error)
-    }
+#[derive(Debug, serde::Serialize)]
+struct ErrorResponse {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    error: ErrorDetail,
 }
 
-impl IntoResponse for AnthropicError {
-    fn into_response(self) -> Response {
-        (self.0.status_code(), Json(error_body(&self.0))).into_response()
-    }
+#[derive(Debug, serde::Serialize)]
+struct ErrorDetail {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: String,
 }
 
-fn error_body(error: &ApiError) -> serde_json::Value {
-    let kind = match error.status_code().as_u16() {
-        400 => "invalid_request_error",
-        404 => "not_found_error",
-        409 => "conflict_error",
-        503 => "overloaded_error",
-        _ => "api_error",
+fn error_body(error: ApiError) -> ErrorResponse {
+    let (kind, message) = match error {
+        ApiError::InvalidRequest { message, .. } | ApiError::JsonParseError { message } => {
+            ("invalid_request_error", message)
+        }
+        ApiError::ModelNotFound { model } => (
+            "not_found_error",
+            format!("The model `{model}` does not exist."),
+        ),
+        ApiError::NotFound { message } => ("not_found_error", message),
+        ApiError::Conflict { message } => ("conflict_error", message),
+        ApiError::ServiceUnavailable { message } => ("overloaded_error", message),
+        ApiError::ServerError { message } => ("api_error", message),
     };
-    json!({"type": "error", "error": {"type": kind,
-        "message": error.to_error_response().error.message}})
+    ErrorResponse {
+        kind: "error",
+        error: ErrorDetail { kind, message },
+    }
+}
+
+fn error_response(error: ApiError) -> Response {
+    (error.status_code(), Json(error_body(error))).into_response()
 }
 
 pub async fn count_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<ValidatedJson<CountTokensRequest>, ApiError>,
-) -> Result<Json<serde_json::Value>, AnthropicError> {
-    let request = body?.0.into_chat()?;
-    let model = state.resolve_model_with_loras(request.model.as_deref()).await;
-    let request = lower_chat_request(request, &model, resolve_request_context(&headers, None))?;
-    let text = state
-        .chat
-        .request_processor()
-        .prepare_for_tokenization(request)
+) -> Response {
+    let body = match body {
+        Ok(body) => body.0,
+        Err(error) => return error_response(error),
+    };
+    match MessagesLlm::new(&state)
+        .count_tokens(body, resolve_request_context(&headers, None))
         .await
-        .map_err(|error| chat_submit_error("count_tokens failed", error))?;
-    let tokens = state
-        .chat
-        .text()
-        .request_processor()
-        .tokenize(text)
-        .map_err(|error| text_submit_error("count_tokens failed", error))?;
-    Ok(Json(json!({"input_tokens": tokens.len(),
-        "context_management": {"original_input_tokens": tokens.len()}})))
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct CountTokensResponse {
+    input_tokens: usize,
+    context_management: CountContext,
+}
+#[derive(serde::Serialize)]
+struct CountContext {
+    original_input_tokens: usize,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -328,7 +351,9 @@ pub struct MessagesRequest {
     input: CountTokensRequest,
     #[validate(range(min = 1))]
     max_tokens: u32,
+    #[validate(range(min = 0.0, max = 2.0))]
     temperature: Option<f32>,
+    #[validate(custom(function = "validate_top_p_value"))]
     top_p: Option<f32>,
     top_k: Option<u32>,
     stop_sequences: Option<Vec<String>>,
@@ -338,23 +363,25 @@ pub struct MessagesRequest {
 impl Normalizable for MessagesRequest {}
 
 impl MessagesRequest {
-    fn into_chat(self) -> Result<ChatCompletionRequest, ApiError> {
-        let mut request = self.input.into_chat()?;
-        request.stream = self.stream.unwrap_or(false);
-        if request.stream {
-            request.stream_options = Some(crate::routes::openai::utils::types::StreamOptions {
-                include_usage: Some(true),
-                continuous_usage_stats: Some(true),
-            });
+    fn into_chat(
+        self,
+        model: &LoraModelResolution,
+        ctx: ResolvedRequestContext,
+    ) -> Result<ChatRequest, ApiError> {
+        let mut request = self.input.into_chat(model, ctx)?;
+        request.intermediate = self.stream.unwrap_or(false);
+        request.sampling_params.max_tokens = Some(self.max_tokens);
+        request.sampling_params.temperature = self.temperature;
+        request.sampling_params.top_p = self.top_p;
+        request.sampling_params.top_k = self.top_k;
+        if let Some(stops) = self.stop_sequences {
+            let stops = StringOrArray::Array(stops);
+            validate_stop(&stops).map_err(|error| invalid_request!("{error}"))?;
+            request.decode_options.stop_strings = Some(stops.into_vec());
         }
-        request.max_completion_tokens = Some(self.max_tokens);
-        request.temperature = self.temperature;
-        request.top_p = self.top_p;
-        request.top_k = self.top_k;
-        request.stop = self
-            .stop_sequences
-            .map(crate::routes::openai::utils::types::StringOrArray::Array);
-        request.validate().map_err(|error| invalid_request!("{error}"))?;
+        request
+            .validate()
+            .map_err(|error| chat_submit_error("invalid Messages request", error))?;
         Ok(request)
     }
 }
@@ -363,95 +390,276 @@ pub async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<ValidatedJson<MessagesRequest>, ApiError>,
-) -> Result<Response, AnthropicError> {
-    let request = body?.0.into_chat()?;
-    let keep_alive = state.api_server_options.sse_keep_alive_interval;
-    let response = match create_chat_completion(state, headers, request).await? {
-        ChatCompletionOutput::Full(response) => response,
-        ChatCompletionOutput::Stream(stream) => {
-            return Ok(crate::utils::sse_response(
-                stream::messages_stream(stream),
-                keep_alive,
-            ));
-        }
+) -> Response {
+    let body = match body {
+        Ok(body) => body.0,
+        Err(error) => return error_response(error),
     };
-    let choice = &response.choices[0];
-    let (reason, sequence) = stop_reason(
-        choice.finish_reason.as_deref(),
-        choice.stop_reason.as_ref(),
-        !choice.message.tool_calls.is_empty(),
-        true,
-    )?;
-    if choice.message.reasoning.is_some() {
-        return Err(invalid_request!("Reasoning output is not supported yet").into());
+    match MessagesLlm::new(&state)
+        .create(body, resolve_request_context(&headers, None))
+        .await
+    {
+        Ok(MessagesOutput::Full(response)) => Json(response).into_response(),
+        Ok(MessagesOutput::Stream(events)) => crate::utils::sse_response(
+            events.map(|event| {
+                let body = match event {
+                    Ok(event) => {
+                        serde_json::to_value(event).expect("Messages event must serialize")
+                    }
+                    Err(error) => serde_json::to_value(error_body(error))
+                        .expect("Messages error must serialize"),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default()
+                        .event(body["type"].as_str().expect("event type"))
+                        .json_data(body)
+                        .expect("Messages event must serialize"),
+                )
+            }),
+            state.api_server_options.sse_keep_alive_interval,
+        ),
+        Err(error) => error_response(error),
     }
-    let mut content = Vec::new();
-    if let Some(text) = &choice.message.content {
-        content.push(json!({"type": "text", "text": text}));
-    }
-    for call in &choice.message.tool_calls {
-        content.push(
-            json!({"type": "tool_use", "id": call.id, "name": call.function.name,
-            "input": tool_input(call.function.arguments.as_deref().unwrap_or(""))?}),
-        );
-    }
-    if content.is_empty() {
-        content.push(json!({"type": "text", "text": ""}));
-    }
-    let mut message = json!({
-        "id": response.id, "type": "message", "role": "assistant", "model": response.model,
-        "content": content,
-        "stop_reason": reason, "stop_sequence": sequence,
-        "usage": usage(response.usage.as_ref()),
-    });
-    if let Some(params) = response.kv_transfer_params {
-        message["kv_transfer_params"] = params;
-    }
-    if let Some(params) = response.ec_transfer_params {
-        message["ec_transfer_params"] = params;
-    }
-    Ok(Json(message).into_response())
 }
 
-fn stop_reason<'a>(
-    finish: Option<&str>,
-    stop: Option<&'a serde_json::Value>,
+pub(crate) enum MessagesOutput {
+    Full(Box<MessagesResponse>),
+    Stream(Pin<Box<dyn futures::Stream<Item = Result<stream::MessagesEvent, ApiError>> + Send>>),
+}
+
+/// Anthropic request handling over the application's shared chat inference.
+pub(crate) struct MessagesLlm<'a> {
+    state: &'a AppState,
+}
+
+impl<'a> MessagesLlm<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+    pub(crate) async fn count_tokens(
+        &self,
+        body: CountTokensRequest,
+        context: ResolvedRequestContext,
+    ) -> Result<CountTokensResponse, ApiError> {
+        let model = self.state.resolve_model_with_loras(Some(&body.model)).await;
+        let request = body.into_chat(&model, context)?;
+        let text = self
+            .state
+            .chat
+            .request_processor()
+            .prepare_for_tokenization(request)
+            .await
+            .map_err(|error| chat_submit_error("count_tokens failed", error))?;
+        let tokens = self
+            .state
+            .chat
+            .text()
+            .request_processor()
+            .tokenize(text)
+            .map_err(|error| text_submit_error("count_tokens failed", error))?;
+        Ok(CountTokensResponse {
+            input_tokens: tokens.len(),
+            context_management: CountContext {
+                original_input_tokens: tokens.len(),
+            },
+        })
+    }
+    pub(crate) async fn create(
+        &self,
+        body: MessagesRequest,
+        context: ResolvedRequestContext,
+    ) -> Result<MessagesOutput, ApiError> {
+        let model = self.state.resolve_model_with_loras(Some(&body.input.model)).await;
+        let request = body.into_chat(&model, context)?;
+        validate_max_output_tokens(
+            "max_tokens",
+            request.sampling_params.max_tokens,
+            self.state.chat.engine_core_client().max_model_len(),
+        )?;
+        let request_id = request.request_id.clone();
+        let span = tracing::info_span!("messages", request_id = %request_id, engine_request_id = tracing::field::Empty);
+        let streaming = request.intermediate;
+        let chat_stream = self
+            .state
+            .chat
+            .chat(request)
+            .instrument(span.clone())
+            .await
+            .map_err(|error| chat_submit_error("failed to submit Messages request", error))?;
+        if streaming {
+            return Ok(MessagesOutput::Stream(Box::pin(
+                stream::messages_stream(
+                    chat_stream,
+                    request_id,
+                    model.response_model(),
+                    self.state.api_server_options,
+                )
+                .instrument(span),
+            )));
+        }
+        let response = async {
+        let response = chat_stream.collect_message().await
+            .map_err(|error| chat_submit_error("failed to collect Messages response", error))?;
+        let (reason, sequence) = stop_reason(&response.finish_reason, response.message.has_tool_calls())?;
+        if response.message.has_reasoning() {
+            return Err(invalid_request!("Reasoning output is not supported yet"));
+        }
+        let text = response.message.text();
+        let options = self.state.api_server_options;
+        if options.enable_log_requests {
+            tracing::info!(model = %model.response_model(), prompt_tokens = response.usage.prompt_token_count,
+                output_tokens = response.usage.output_token_count, finish_reason = reason, "Messages finished");
+        }
+        if options.log_outputs.logs_complete() && !text.is_empty() {
+            options.log_outputs.log(LoggedOutput::Response, &text, Some(&response.token_ids), Some(reason));
+        }
+        Ok(MessagesResponse {
+            id: request_id, message_type: "message", role: "assistant", model: model.response_model(),
+            content: response_blocks(&response.message.content)?, stop_reason: Some(reason), stop_sequence: sequence.map(str::to_owned),
+            usage: usage(response.usage.engine, options.enable_prompt_tokens_details),
+            kv_transfer_params: response.kv_transfer_params, ec_transfer_params: response.ec_transfer_params,
+        })
+    }.instrument(span).await?;
+        Ok(MessagesOutput::Full(Box::new(response)))
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct MessagesResponse {
+    id: String,
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    role: &'static str,
+    model: String,
+    content: Vec<ResponseBlock>,
+    stop_reason: Option<&'static str>,
+    stop_sequence: Option<String>,
+    usage: MessagesUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_transfer_params: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ec_transfer_params: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponseBlock {
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Map<String, serde_json::Value>,
+    },
+    Text {
+        text: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct MessagesUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read_input_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_creation_input_tokens: Option<usize>,
+}
+
+fn stop_reason(
+    finish: &FinishReason,
     tool_used: bool,
-    tool_complete: bool,
-) -> Result<(&'static str, Option<&'a str>), ApiError> {
+) -> Result<(&'static str, Option<&str>), ApiError> {
     match finish {
-        Some("length") => Ok(("max_tokens", None)),
-        Some("stop" | "tool_calls") if tool_used && tool_complete => Ok(("tool_use", None)),
-        Some("stop" | "tool_calls") => match stop.and_then(serde_json::Value::as_str) {
-            Some(text) => Ok(("stop_sequence", Some(text))),
-            None if tool_used => Ok(("tool_use", None)),
-            None => Ok(("end_turn", None)),
-        },
+        FinishReason::Error(error) => Err(crate::error::engine_error(error.as_deref())),
+        FinishReason::Length => Ok(("max_tokens", None)),
+        FinishReason::Stop(_) if tool_used => Ok(("tool_use", None)),
+        FinishReason::Stop(Some(StopReason::Text(text))) => Ok(("stop_sequence", Some(text))),
+        FinishReason::Stop(_) => Ok(("end_turn", None)),
         _ => Err(server_error!("Generation did not complete successfully")),
     }
 }
 
-fn usage(usage: Option<&crate::routes::openai::utils::types::Usage>) -> serde_json::Value {
-    let Some(usage) = usage else {
-        return json!({"input_tokens": 0, "output_tokens": 0});
-    };
-    let mut result = json!({"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens.unwrap_or(0)});
-    if let Some(details) = &usage.prompt_tokens_details {
-        let cached = details.cached_tokens;
-        let created = details.created_cache_tokens;
-        result["input_tokens"] =
-            json!(usage.prompt_tokens.saturating_sub(cached).saturating_sub(created));
-        result["cache_read_input_tokens"] = json!(cached);
-        result["cache_creation_input_tokens"] = json!(created);
+fn usage(usage: TokenUsage, include_cache: bool) -> MessagesUsage {
+    let cached = usage.prompt_cache_usage.cached_token_count;
+    let created = usage.prompt_cache_usage.cache_creation_token_count;
+    MessagesUsage {
+        input_tokens: if include_cache {
+            usage.prompt_token_count.saturating_sub(cached).saturating_sub(created)
+        } else {
+            usage.prompt_token_count
+        },
+        output_tokens: usage.output_token_count,
+        cache_read_input_tokens: include_cache.then_some(cached),
+        cache_creation_input_tokens: include_cache.then_some(created),
     }
-    result
 }
 
-fn tool_input(arguments: &str) -> Result<serde_json::Value, ApiError> {
+fn tool_input(arguments: &str) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
     if arguments.is_empty() {
-        return Ok(json!({}));
+        return Ok(Default::default());
     }
-    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(arguments)
-        .map(serde_json::Value::Object)
+    serde_json::from_str(arguments)
         .map_err(|_| server_error!("Generated tool arguments are not a complete JSON object"))
+}
+
+fn response_blocks(blocks: &[AssistantContentBlock]) -> Result<Vec<ResponseBlock>, ApiError> {
+    let mut result = Vec::new();
+    for block in blocks {
+        result.push(match block {
+            AssistantContentBlock::Text { text } => ResponseBlock::Text { text: text.clone() },
+            AssistantContentBlock::ToolCall(call) => ResponseBlock::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: tool_input(&call.arguments)?,
+            },
+            _ => return Err(server_error!("Reasoning output is not supported yet")),
+        });
+    }
+    if result.is_empty() {
+        result.push(ResponseBlock::Text {
+            text: String::new(),
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn anthropic_error_payloads_preserve_semantics() {
+        for (error, kind, message) in [
+            (
+                ApiError::invalid_request("bad input", Some("messages")),
+                "invalid_request_error",
+                "bad input",
+            ),
+            (
+                ApiError::json_parse_error("bad JSON"),
+                "invalid_request_error",
+                "bad JSON",
+            ),
+            (
+                ApiError::model_not_found("missing"),
+                "not_found_error",
+                "The model `missing` does not exist.",
+            ),
+            (
+                ApiError::not_found("missing resource"),
+                "not_found_error",
+                "missing resource",
+            ),
+            (ApiError::conflict("busy"), "conflict_error", "busy"),
+            (
+                ApiError::service_unavailable("paused"),
+                "overloaded_error",
+                "paused",
+            ),
+            (ApiError::server_error("failed"), "api_error", "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(error_body(error)).unwrap(),
+                json!({"type":"error","error":{"type":kind,"message":message}})
+            );
+        }
+    }
 }

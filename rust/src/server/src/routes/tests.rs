@@ -4657,36 +4657,40 @@ async fn health_endpoint_returns_503_after_engine_core_dead_sentinel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn load_endpoint_resets_when_stream_response_is_dropped() {
-    let (app, engine_task) = test_app_with_engine_handle().await;
+    for (uri, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "prompt": "hello", "stream": true}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 10, "stream": true}),
+        ),
+    ] {
+        let (app, engine_task) = test_app_with_engine_handle().await;
 
-    let response = app
-        .clone()
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "prompt": "hello",
-                        "stream": true
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
+        let response = app
+            .clone()
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(server_load(&app).await, 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(server_load(&app).await, 1);
 
-    drop(response);
-    tokio::task::yield_now().await;
-    engine_task.await.expect("mock engine task");
+        drop(response);
+        tokio::task::yield_now().await;
+        engine_task.await.expect("mock engine task");
 
-    assert_eq!(server_load(&app).await, 0);
+        assert_eq!(server_load(&app).await, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4806,8 +4810,27 @@ async fn engine_request_errors_map_to_http_status() {
             "ServiceUnavailableError",
         ),
         (invalid, StatusCode::BAD_REQUEST, "BadRequestError"),
+        (
+            RequestError {
+                code: "unknown".into(),
+                message: "Internal server error".into(),
+                retryable: false,
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+        ),
     ] {
         let cases = [
+            (
+                "/v1/messages",
+                json!({"model": model, "messages": messages, "max_tokens": 10}),
+                status,
+            ),
+            (
+                "/v1/messages",
+                json!({"model":model,"messages":messages,"max_tokens":10,"stream":true}),
+                StatusCode::OK,
+            ),
             (
                 "/v1/completions",
                 json!({"model": model, "prompt": "hello"}),
@@ -4861,12 +4884,36 @@ async fn engine_request_errors_map_to_http_status() {
             let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
             engine_task.await.expect("mock engine task");
             let text = String::from_utf8(body.to_vec()).expect("utf8 body");
-            assert!(
-                text.contains(&format!("\"type\":\"{error_type}\""))
-                    && text.contains(&format!("\"code\":{}", status.as_u16()))
-                    && text.contains(&error.message),
-                "{uri} {request}: {text}"
-            );
+            if uri == "/v1/messages" {
+                let expected = match error_type {
+                    "ServiceUnavailableError" => "overloaded_error",
+                    "BadRequestError" => "invalid_request_error",
+                    _ => "api_error",
+                };
+                let body: serde_json::Value =
+                    if request["stream"] == true {
+                        let events: Vec<serde_json::Value> = sse_data_payloads(&text)
+                            .iter()
+                            .map(|event| serde_json::from_str(event).unwrap())
+                            .collect();
+                        assert!(!events.iter().any(|event| event["type"] == "message_stop"
+                            || event["type"] == "message_delta"));
+                        events.last().unwrap().clone()
+                    } else {
+                        serde_json::from_str(&text).unwrap()
+                    };
+                assert_eq!(
+                    body,
+                    json!({"type": "error", "error": {"type": expected, "message": error.message}})
+                );
+            } else {
+                assert!(
+                    text.contains(&format!("\"type\":\"{error_type}\""))
+                        && text.contains(&format!("\"code\":{}", status.as_u16()))
+                        && text.contains(&error.message),
+                    "{uri} {request}: {text}"
+                );
+            }
         }
     }
 }
@@ -10724,6 +10771,56 @@ async fn anthropic_text_generation_reports_content_and_stop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn anthropic_rejects_invalid_model_and_sampling_before_generation() {
+    let mut app = test_app().await;
+    for (field, value, status) in [
+        ("model", json!("missing-model"), StatusCode::NOT_FOUND),
+        ("temperature", json!(-1), StatusCode::BAD_REQUEST),
+        ("top_p", json!(1.1), StatusCode::BAD_REQUEST),
+        ("stop_sequences", json!([""]), StatusCode::BAD_REQUEST),
+    ] {
+        let mut request = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hi"}]});
+        request[field] = value;
+        let (actual, body) = post_json(&mut app, "/v1/messages", request).await;
+        assert_eq!(actual, status, "{body}");
+        assert_eq!(body["type"], "error");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_assistant_prefix_count_matches_generation_without_echo() {
+    let (mut app, engine_task) = test_app_with_stream_output_specs(vec![(
+        bytes_to_token_ids(b"continuation"),
+        Some(EngineCoreFinishReason::Length),
+    )])
+    .await;
+    let input = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "messages": [
+        {"role": "user", "content": "Complete"},
+        {"role": "assistant", "content": "prefix"}
+    ]});
+    let (status, count) = post_json(&mut app, "/v1/messages/count_tokens", input.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{count}");
+    // The fixture renderer appends `assistant:` only for a new turn.
+    assert_eq!(
+        count["input_tokens"],
+        b"user: Complete\nassistant: prefix\n".len()
+    );
+    let mut generation = input;
+    generation["max_tokens"] = json!(20);
+    let (status, response) = post_json(&mut app, "/v1/messages", generation).await;
+    engine_task.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["usage"]["input_tokens"], count["input_tokens"]);
+    assert_eq!(
+        response["content"],
+        json!([{"type": "text", "text": "continuation"}])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn anthropic_stream_preserves_text_order_and_terminal_usage() {
     let (mut app, engine_task) = test_app_with_stream_output_specs(vec![
         (bytes_to_token_ids(b"Hel"), None),
@@ -10886,4 +10983,51 @@ async fn anthropic_counts_tool_history_without_output_parser() {
     })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["input_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_errors_cover_extraction_and_counting() {
+    let mut app = test_app().await;
+    for uri in ["/v1/messages", "/v1/messages/count_tokens"] {
+        for (body, status, kind) in [
+            (
+                "{".to_owned(),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                json!({"model": "missing", "messages": [{"role":"user","content":"Hi"}]})
+                    .to_string(),
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+            ),
+        ] {
+            let body = if body != "{" && uri == "/v1/messages" {
+                let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                value["max_tokens"] = json!(10);
+                value.to_string()
+            } else {
+                body
+            };
+            let response = app
+                .call(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let value: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["type"], "error");
+            assert_eq!(value["error"]["type"], kind);
+            assert!(value["error"].get("code").is_none());
+        }
+    }
 }

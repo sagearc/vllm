@@ -1,235 +1,238 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::convert::Infallible;
-
 use asynk_strim_attr::{TryYielder, try_stream};
-use axum::response::sse::Event;
-use futures::{Stream, StreamExt as _, pin_mut};
-use serde_json::{Value, json};
 
-use super::{error_body, stop_reason, tool_input, usage};
-use crate::error::{ApiError, server_error};
-use crate::routes::openai::chat_completions::types::ChatCompletionStreamResponse;
-use crate::routes::openai::utils::types::ToolCallDelta;
+use futures::StreamExt as _;
+use serde::Serialize;
+use vllm_chat::{AssistantBlockKind, AssistantMessageExt as _, ChatEvent, ChatEventStream};
+use vllm_llm::TokenUsage;
 
-fn event(body: Value) -> Event {
-    Event::default()
-        .event(body["type"].as_str().expect("event type"))
-        .json_data(body)
-        .expect("JSON event")
+use super::{MessagesResponse, MessagesUsage, ResponseBlock, stop_reason, tool_input, usage};
+use crate::config::ApiServerOptions;
+use crate::error::{ApiError, chat_submit_error, server_error};
+use crate::routes::output_log::{LoggedOutput, StreamDeltaLog};
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum MessagesEvent {
+    MessageStart {
+        message: Box<MessagesResponse>,
+    },
+    ContentBlockStart {
+        index: usize,
+        content_block: ResponseBlock,
+    },
+    ContentBlockDelta {
+        index: usize,
+        delta: MessagesDelta,
+    },
+    ContentBlockStop {
+        index: usize,
+    },
+    MessageDelta {
+        delta: StopDelta,
+        usage: MessagesUsage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_transfer_params: Option<Box<serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ec_transfer_params: Option<Box<serde_json::Value>>,
+    },
+    MessageStop,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum MessagesDelta {
+    TextDelta { text: String },
+    InputJsonDelta { partial_json: String },
+}
+
+#[derive(Serialize)]
+pub(crate) struct StopDelta {
+    stop_reason: &'static str,
+    stop_sequence: Option<String>,
 }
 
 #[try_stream]
 pub(super) async fn messages_stream(
-    stream: impl Stream<Item = Result<ChatCompletionStreamResponse, ApiError>>,
-    mut y: TryYielder<Event, Infallible>,
-) -> Result<(), Infallible> {
-    pin_mut!(stream);
-    let mut started = false;
-    let mut blocks = Blocks::default();
-    let mut final_usage = usage(None);
-    let mut finish = None;
-    let mut matched_stop = None;
-    let mut transfer = None;
-    let mut failure = None;
+    mut stream: ChatEventStream,
+    request_id: String,
+    model: String,
+    options: ApiServerOptions,
+    mut y: TryYielder<MessagesEvent, ApiError>,
+) -> Result<(), ApiError> {
+    let mut delta_log = options
+        .log_outputs
+        .logs_deltas()
+        .then(|| StreamDeltaLog::new(options.log_outputs));
+    let mut saw_block = false;
+    let mut index = 0;
     while let Some(next) = stream.next().await {
-        let chunk = match next {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                failure = Some(error);
-                break;
+        let next = next.map_err(|error| chat_submit_error("Messages stream failed", error))?;
+        match next {
+            ChatEvent::Start {
+                prompt_token_ids, ..
+            } => {
+                y.yield_ok(MessagesEvent::MessageStart {
+                    message: Box::new(MessagesResponse {
+                        id: request_id.clone(),
+                        message_type: "message",
+                        role: "assistant",
+                        model: model.clone(),
+                        content: vec![],
+                        stop_reason: None,
+                        stop_sequence: None,
+                        usage: usage(
+                            TokenUsage {
+                                prompt_token_count: prompt_token_ids.len(),
+                                ..Default::default()
+                            },
+                            false,
+                        ),
+                        kv_transfer_params: None,
+                        ec_transfer_params: None,
+                    }),
+                })
+                .await;
             }
-        };
-        if chunk.usage.is_some() {
-            final_usage = usage(chunk.usage.as_ref());
-        }
-        if !started {
-            y.yield_ok(event(json!({"type": "message_start", "message": {
-                "id": chunk.envelope.id(), "type": "message", "role": "assistant",
-                "model": chunk.envelope.model(), "content": [], "stop_reason": null,
-                "stop_sequence": null, "usage": final_usage,
-            }})))
-            .await;
-            started = true;
-        }
-        transfer = chunk.kv_transfer_params.or(transfer);
-        for choice in chunk.choices {
-            if choice.delta.reasoning.is_some() {
-                failure = Some(server_error!("Reasoning output is not supported yet"));
-                break;
+            ChatEvent::BlockStart {
+                index: _,
+                kind: AssistantBlockKind::Text,
+            } => {
+                saw_block = true;
+                y.yield_ok(MessagesEvent::ContentBlockStart {
+                    index,
+                    content_block: ResponseBlock::Text {
+                        text: String::new(),
+                    },
+                })
+                .await;
             }
-            let mut events = Vec::new();
-            if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
-                blocks.text(text, &mut events);
+            ChatEvent::BlockDelta {
+                index: _,
+                kind: AssistantBlockKind::Text,
+                delta,
+                ..
+            } => {
+                if let Some(log) = &mut delta_log {
+                    log.block_delta(AssistantBlockKind::Text, &delta);
+                }
+                y.yield_ok(MessagesEvent::ContentBlockDelta {
+                    index,
+                    delta: MessagesDelta::TextDelta { text: delta },
+                })
+                .await;
             }
-            for call in choice.delta.tool_calls.unwrap_or_default() {
-                if let Err(error) = blocks.tool(call, &mut events) {
-                    failure = Some(error);
-                    break;
+            ChatEvent::BlockStart {
+                kind: AssistantBlockKind::Reasoning,
+                ..
+            } => {}
+            ChatEvent::BlockEnd { block, .. } => {
+                if block.kind() == AssistantBlockKind::Reasoning {
+                    continue;
+                }
+                y.yield_ok(MessagesEvent::ContentBlockStop { index }).await;
+                index += 1;
+            }
+            ChatEvent::ToolCallStart { id, name, .. } => {
+                saw_block = true;
+                y.yield_ok(MessagesEvent::ContentBlockStart {
+                    index,
+                    content_block: ResponseBlock::ToolUse {
+                        id,
+                        name,
+                        input: Default::default(),
+                    },
+                })
+                .await;
+            }
+            ChatEvent::ToolCallArgumentsDelta { delta, .. } => {
+                if let Some(log) = &mut delta_log {
+                    log.tool_arguments(&delta);
+                }
+                y.yield_ok(MessagesEvent::ContentBlockDelta {
+                    index,
+                    delta: MessagesDelta::InputJsonDelta {
+                        partial_json: delta,
+                    },
+                })
+                .await;
+            }
+            ChatEvent::ToolCallEnd { .. } => {
+                y.yield_ok(MessagesEvent::ContentBlockStop { index }).await;
+                index += 1;
+            }
+            ChatEvent::LogprobsDelta { token_ids, .. } => {
+                if let Some(log) = &mut delta_log {
+                    log.end_update(&token_ids);
                 }
             }
-            for body in events {
-                y.yield_ok(event(body)).await;
+            ChatEvent::Done {
+                message,
+                usage: final_usage,
+                finish_reason,
+                kv_transfer_params,
+                ec_transfer_params,
+                ..
+            } => {
+                let (reason, sequence) = stop_reason(&finish_reason, message.has_tool_calls())?;
+                if !matches!(finish_reason, vllm_chat::FinishReason::Length) {
+                    for call in message.tool_calls() {
+                        tool_input(&call.arguments)?;
+                    }
+                }
+                if let Some(log) = &mut delta_log {
+                    log.finish(Some(reason));
+                }
+                if options.enable_log_requests {
+                    tracing::info!(
+                        model,
+                        prompt_tokens = final_usage.prompt_token_count,
+                        output_tokens = final_usage.output_token_count,
+                        finish_reason = reason,
+                        "Messages finished"
+                    );
+                }
+                if options.log_outputs.logs_complete() {
+                    options.log_outputs.log(
+                        LoggedOutput::StreamComplete,
+                        &message.text(),
+                        None,
+                        Some(reason),
+                    );
+                }
+                if !saw_block {
+                    y.yield_ok(MessagesEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ResponseBlock::Text {
+                            text: String::new(),
+                        },
+                    })
+                    .await;
+                    y.yield_ok(MessagesEvent::ContentBlockStop { index: 0 }).await;
+                }
+                y.yield_ok(MessagesEvent::MessageDelta {
+                    delta: StopDelta {
+                        stop_reason: reason,
+                        stop_sequence: sequence.map(str::to_owned),
+                    },
+                    usage: usage(final_usage.engine, options.enable_prompt_tokens_details),
+                    kv_transfer_params,
+                    ec_transfer_params,
+                })
+                .await;
+                y.yield_ok(MessagesEvent::MessageStop).await;
+                return Ok(());
             }
-            if choice.finish_reason.is_some() {
-                finish = choice.finish_reason;
-                matched_stop = choice.stop_reason;
-            }
-        }
-        if failure.is_some() {
-            break;
-        }
-    }
-    let reason = stop_reason(
-        finish.as_deref(),
-        matched_stop.as_ref(),
-        blocks.tool_used,
-        tool_input(&blocks.tool_arguments).is_ok(),
-    );
-    let mut events = Vec::new();
-    blocks.finish(&mut events);
-    if failure.is_none() && reason.is_ok() && blocks.index == 0 {
-        blocks.text(String::new(), &mut events);
-        blocks.close(&mut events);
-    }
-    for body in events {
-        y.yield_ok(event(body)).await;
-    }
-    match failure.map_or(reason, Err) {
-        Err(error) => y.yield_ok(event(error_body(&error))).await,
-        Ok((reason, sequence)) => {
-            let mut delta = json!({"type": "message_delta", "delta": {
-                "stop_reason": reason, "stop_sequence": sequence}, "usage": final_usage});
-            if let Some(transfer) = transfer {
-                delta["kv_transfer_params"] = transfer;
-            }
-            y.yield_ok(event(delta)).await;
-            y.yield_ok(event(json!({"type": "message_stop"}))).await;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Kind {
-    Text,
-    Tool(u32),
-}
-
-#[derive(Default)]
-struct Blocks {
-    index: usize,
-    open: Option<Kind>,
-    tool_arguments: String,
-    tool_used: bool,
-    pending_text: String,
-}
-
-impl Blocks {
-    fn close(&mut self, events: &mut Vec<Value>) {
-        if self.open.take().is_some() {
-            events.push(json!({"type": "content_block_stop", "index": self.index}));
-            self.index += 1;
-        }
-    }
-
-    fn text(&mut self, text: String, events: &mut Vec<Value>) {
-        if matches!(self.open, Some(Kind::Tool(_))) {
-            self.pending_text.push_str(&text);
-            return;
-        }
-        if self.open != Some(Kind::Text) {
-            self.close(events);
-            events.push(json!({"type": "content_block_start", "index": self.index,
-                "content_block": {"type": "text", "text": ""}}));
-            self.open = Some(Kind::Text);
-        }
-        if !text.is_empty() {
-            events.push(json!({"type": "content_block_delta", "index": self.index,
-                "delta": {"type": "text_delta", "text": text}}));
-        }
-    }
-
-    fn finish(&mut self, events: &mut Vec<Value>) {
-        self.close(events);
-        if !self.pending_text.is_empty() {
-            let text = std::mem::take(&mut self.pending_text);
-            self.text(text, events);
-            self.close(events);
-        }
-    }
-
-    fn tool(&mut self, call: ToolCallDelta, events: &mut Vec<Value>) -> Result<(), ApiError> {
-        let Some(function) = call.function else {
-            return Ok(());
-        };
-        if let Some(id) = call.id {
-            self.finish(events);
-            let name = function.name.ok_or_else(|| server_error!("Tool call has no name"))?;
-            events.push(json!({"type": "content_block_start", "index": self.index,
-                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}));
-            self.open = Some(Kind::Tool(call.index));
-            self.tool_used = true;
-            self.tool_arguments.clear();
-        }
-        if let Some(arguments) = function.arguments.filter(|args| !args.is_empty()) {
-            if self.open != Some(Kind::Tool(call.index)) {
+            _ => {
                 return Err(server_error!(
-                    "Tool arguments arrived without their tool call"
+                    "Reasoning and tool output are not supported yet"
                 ));
             }
-            self.tool_arguments.push_str(&arguments);
-            events.push(json!({"type": "content_block_delta", "index": self.index,
-                "delta": {"type": "input_json_delta", "partial_json": arguments}}));
         }
-        Ok(())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routes::openai::utils::types::FunctionCallDelta;
-
-    #[test]
-    fn text_between_argument_deltas_does_not_truncate_a_tool_call() {
-        let mut blocks = Blocks::default();
-        let mut events = Vec::new();
-        for (id, name, arguments, text) in [
-            (
-                Some("call1"),
-                Some("weather"),
-                "{\"city\":\"Paris\"",
-                Some("after tool"),
-            ),
-            (None, None, "}", None),
-        ] {
-            blocks
-                .tool(
-                    ToolCallDelta {
-                        index: 0,
-                        id: id.map(str::to_owned),
-                        tool_type: None,
-                        function: Some(FunctionCallDelta {
-                            name: name.map(str::to_owned),
-                            arguments: Some(arguments.into()),
-                        }),
-                    },
-                    &mut events,
-                )
-                .unwrap();
-            if let Some(text) = text {
-                blocks.text(text.into(), &mut events);
-            }
-        }
-        blocks.finish(&mut events);
-        assert_eq!(events[2]["delta"]["partial_json"], "}");
-        assert_eq!(events[3], json!({"type": "content_block_stop", "index": 0}));
-        assert_eq!(events[5]["delta"]["text"], "after tool");
-        assert_eq!(
-            tool_input(&blocks.tool_arguments).unwrap(),
-            json!({"city": "Paris"})
-        );
-    }
+    Err(server_error!(
+        "Messages stream ended without a terminal result"
+    ))
 }

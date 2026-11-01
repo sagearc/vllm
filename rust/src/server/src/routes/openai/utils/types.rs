@@ -249,10 +249,6 @@ impl StreamResponseEnvelope {
         }
     }
 
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
     pub(crate) fn model(&self) -> &str {
         &self.model
     }
