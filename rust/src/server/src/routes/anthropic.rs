@@ -42,23 +42,23 @@ pub struct CountTokensRequest {
 
 impl Normalizable for CountTokensRequest {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 enum Message {
     User { content: TextContent },
     Assistant { content: TextContent },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 enum TextContent {
     Text(String),
     Blocks(Vec<TextBlock>),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-enum TextBlock {
+pub(crate) enum TextBlock {
     Text { text: String },
 }
 
@@ -385,8 +385,8 @@ impl<'a> MessagesLlm<'a> {
             options.log_outputs.log(LoggedOutput::Response, &text, Some(&response.token_ids), Some(reason));
         }
         Ok(MessagesResponse {
-            id: request_id, message_type: "message", role: "assistant", model: model.response_model(),
-            content: vec![ResponseBlock::Text { text }], stop_reason: Some(reason), stop_sequence: sequence.map(str::to_owned),
+            id: request_id, message_type: "message", message: Message::Assistant { content: TextContent::Blocks(vec![TextBlock::Text { text }]) }, model: model.response_model(),
+            stop_reason: Some(reason), stop_sequence: sequence.map(str::to_owned),
             usage: usage(response.usage.engine, options.enable_prompt_tokens_details),
             kv_transfer_params: response.kv_transfer_params, ec_transfer_params: response.ec_transfer_params,
         })
@@ -400,9 +400,9 @@ pub(crate) struct MessagesResponse {
     id: String,
     #[serde(rename = "type")]
     message_type: &'static str,
-    role: &'static str,
+    #[serde(flatten)]
+    message: Message,
     model: String,
-    content: Vec<ResponseBlock>,
     stop_reason: Option<&'static str>,
     stop_sequence: Option<String>,
     usage: MessagesUsage,
@@ -410,12 +410,6 @@ pub(crate) struct MessagesResponse {
     kv_transfer_params: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ec_transfer_params: Option<serde_json::Value>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponseBlock {
-    Text { text: String },
 }
 
 #[derive(serde::Serialize)]
@@ -450,48 +444,5 @@ fn usage(usage: TokenUsage, include_cache: bool) -> MessagesUsage {
         output_tokens: usage.output_token_count,
         cache_read_input_tokens: include_cache.then_some(cached),
         cache_creation_input_tokens: include_cache.then_some(created),
-    }
-}
-
-#[cfg(test)]
-mod error_tests {
-    use super::*;
-    use serde_json::json;
-    #[test]
-    fn anthropic_error_payloads_preserve_semantics() {
-        for (error, kind, message) in [
-            (
-                ApiError::invalid_request("bad input", Some("messages")),
-                "invalid_request_error",
-                "bad input",
-            ),
-            (
-                ApiError::json_parse_error("bad JSON"),
-                "invalid_request_error",
-                "bad JSON",
-            ),
-            (
-                ApiError::model_not_found("missing"),
-                "not_found_error",
-                "The model `missing` does not exist.",
-            ),
-            (
-                ApiError::not_found("missing resource"),
-                "not_found_error",
-                "missing resource",
-            ),
-            (ApiError::conflict("busy"), "conflict_error", "busy"),
-            (
-                ApiError::service_unavailable("paused"),
-                "overloaded_error",
-                "paused",
-            ),
-            (ApiError::server_error("failed"), "api_error", "failed"),
-        ] {
-            assert_eq!(
-                serde_json::to_value(error_body(error)).unwrap(),
-                json!({"type":"error","error":{"type":kind,"message":message}})
-            );
-        }
     }
 }

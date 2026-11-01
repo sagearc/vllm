@@ -8,7 +8,7 @@ use serde::Serialize;
 use vllm_chat::{AssistantBlockKind, AssistantMessageExt as _, ChatEvent, ChatEventStream};
 use vllm_llm::TokenUsage;
 
-use super::{MessagesResponse, MessagesUsage, ResponseBlock, stop_reason, usage};
+use super::{Message, MessagesResponse, MessagesUsage, TextBlock, TextContent, stop_reason, usage};
 use crate::config::ApiServerOptions;
 use crate::error::{ApiError, chat_submit_error, server_error};
 use crate::routes::output_log::{LoggedOutput, StreamDeltaLog};
@@ -21,7 +21,7 @@ pub(crate) enum MessagesEvent {
     },
     ContentBlockStart {
         index: usize,
-        content_block: ResponseBlock,
+        content_block: TextBlock,
     },
     ContentBlockDelta {
         index: usize,
@@ -76,9 +76,10 @@ pub(super) async fn messages_stream(
                     message: Box::new(MessagesResponse {
                         id: request_id.clone(),
                         message_type: "message",
-                        role: "assistant",
+                        message: Message::Assistant {
+                            content: TextContent::Blocks(vec![]),
+                        },
                         model: model.clone(),
-                        content: vec![],
                         stop_reason: None,
                         stop_sequence: None,
                         usage: usage(
@@ -101,7 +102,7 @@ pub(super) async fn messages_stream(
                 saw_block = true;
                 y.yield_ok(MessagesEvent::ContentBlockStart {
                     index,
-                    content_block: ResponseBlock::Text {
+                    content_block: TextBlock::Text {
                         text: String::new(),
                     },
                 })
@@ -162,7 +163,7 @@ pub(super) async fn messages_stream(
                 if !saw_block {
                     y.yield_ok(MessagesEvent::ContentBlockStart {
                         index: 0,
-                        content_block: ResponseBlock::Text {
+                        content_block: TextBlock::Text {
                             text: String::new(),
                         },
                     })
