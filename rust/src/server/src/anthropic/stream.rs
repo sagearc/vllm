@@ -11,7 +11,7 @@ use vllm_llm::TokenUsage;
 use super::{
     Block, Content, Message, MessagesResponse, MessagesUsage, stop_reason, tool_input, usage,
 };
-use crate::config::ApiServerOptions;
+use crate::config::OutputLogConfig;
 use crate::error::{ApiError, chat_submit_error, server_error};
 use crate::routes::output_log::{LoggedOutput, StreamDeltaLog};
 
@@ -61,13 +61,12 @@ pub(super) async fn messages_stream(
     mut stream: ChatEventStream,
     request_id: String,
     model: String,
-    options: ApiServerOptions,
+    log_outputs: OutputLogConfig,
+    enable_log_requests: bool,
+    enable_prompt_tokens_details: bool,
     mut y: TryYielder<MessagesEvent, ApiError>,
 ) -> Result<(), ApiError> {
-    let mut delta_log = options
-        .log_outputs
-        .logs_deltas()
-        .then(|| StreamDeltaLog::new(options.log_outputs));
+    let mut delta_log = log_outputs.logs_deltas().then(|| StreamDeltaLog::new(log_outputs));
     let mut saw_block = false;
     let mut index = 0;
     while let Some(next) = stream.next().await {
@@ -188,7 +187,7 @@ pub(super) async fn messages_stream(
                 if let Some(log) = &mut delta_log {
                     log.finish(Some(reason));
                 }
-                if options.enable_log_requests {
+                if enable_log_requests {
                     tracing::info!(
                         model,
                         prompt_tokens = final_usage.prompt_token_count,
@@ -197,8 +196,8 @@ pub(super) async fn messages_stream(
                         "Messages finished"
                     );
                 }
-                if options.log_outputs.logs_complete() {
-                    options.log_outputs.log(
+                if log_outputs.logs_complete() {
+                    log_outputs.log(
                         LoggedOutput::StreamComplete,
                         &message.text(),
                         None,
@@ -220,7 +219,7 @@ pub(super) async fn messages_stream(
                         stop_reason: reason,
                         stop_sequence: sequence.map(str::to_owned),
                     },
-                    usage: usage(final_usage.engine, options.enable_prompt_tokens_details),
+                    usage: usage(final_usage.engine, enable_prompt_tokens_details),
                     kv_transfer_params,
                     ec_transfer_params,
                 })
