@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+mod stream;
+
+use std::pin::Pin;
+
 use serde::Deserialize;
 use validator::Validate;
 
@@ -81,7 +85,7 @@ enum TextContent {
 
 #[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-enum TextBlock {
+pub(crate) enum TextBlock {
     Text { text: String },
 }
 
@@ -119,9 +123,6 @@ impl MessagesRequest {
             return Err(invalid_request!("model and messages must be non-empty"));
         }
         model.model_names.check(Some(&self.model))?;
-        if self.stream == Some(true) {
-            return Err(invalid_request!("Streaming Messages is not supported yet"));
-        }
         let stop_strings = self
             .stop_sequences
             .map(|stops| {
@@ -168,7 +169,7 @@ impl MessagesRequest {
                 stop_strings,
                 ..Default::default()
             },
-            intermediate: false,
+            intermediate: self.stream.unwrap_or(false),
             prompt_truncation: None,
             priority: ctx.priority.unwrap_or(0),
             documents: None,
@@ -194,6 +195,11 @@ pub(crate) struct CountTokensResponse {
 #[derive(serde::Serialize)]
 struct ContextManagement {
     original_input_tokens: usize,
+}
+
+pub(crate) enum MessagesOutput {
+    Full(Box<MessagesResponse>),
+    Stream(Pin<Box<dyn futures::Stream<Item = Result<stream::MessagesEvent, ApiError>> + Send>>),
 }
 
 /// Anthropic request handling over the application's shared chat inference.
@@ -244,7 +250,7 @@ impl<'a> MessagesLlm<'a> {
         body: MessagesRequest,
         model: &LoraModelResolution,
         context: ResolvedRequestContext,
-    ) -> Result<MessagesResponse, ApiError> {
+    ) -> Result<MessagesOutput, ApiError> {
         if body.max_tokens.is_none() {
             return Err(invalid_request!(
                 param = "max_tokens",
@@ -259,10 +265,28 @@ impl<'a> MessagesLlm<'a> {
         )?;
         let request_id = request.request_id.clone();
         let span = tracing::info_span!("messages", request_id = %request_id, engine_request_id = tracing::field::Empty);
+        let streaming = request.intermediate;
+        let chat_stream = self
+            .chat
+            .chat(request)
+            .instrument(span.clone())
+            .await
+            .map_err(|error| chat_submit_error("failed to submit Messages request", error))?;
+        if streaming {
+            return Ok(MessagesOutput::Stream(Box::pin(
+                stream::messages_stream(
+                    chat_stream,
+                    request_id,
+                    model.response_model(),
+                    self.log_outputs,
+                    self.enable_log_requests,
+                    self.enable_prompt_tokens_details,
+                )
+                .instrument(span),
+            )));
+        }
         let response = async {
-        let response = self.chat.chat(request).await
-            .map_err(|error| chat_submit_error("failed to submit Messages request", error))?
-            .collect_message().await
+        let response = chat_stream.collect_message().await
             .map_err(|error| chat_submit_error("failed to collect Messages response", error))?;
         let (reason, sequence) = stop_reason(&response.finish_reason)?;
         if response.message.has_reasoning() || response.message.has_tool_calls() {
@@ -278,12 +302,12 @@ impl<'a> MessagesLlm<'a> {
         }
         Ok(MessagesResponse {
             id: request_id, message_type: "message", message: Message::Assistant { content: TextContent::Blocks(vec![TextBlock::Text { text }]) }, model: model.response_model(),
-            stop_reason: reason, stop_sequence: sequence.map(str::to_owned),
+            stop_reason: Some(reason), stop_sequence: sequence.map(str::to_owned),
             usage: usage(response.usage.engine, self.enable_prompt_tokens_details),
             kv_transfer_params: response.kv_transfer_params, ec_transfer_params: response.ec_transfer_params,
         })
     }.instrument(span).await?;
-        Ok(response)
+        Ok(MessagesOutput::Full(Box::new(response)))
     }
 }
 
@@ -295,7 +319,7 @@ pub(crate) struct MessagesResponse {
     #[serde(flatten)]
     message: Message,
     model: String,
-    stop_reason: &'static str,
+    stop_reason: Option<&'static str>,
     stop_sequence: Option<String>,
     usage: MessagesUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,7 +329,7 @@ pub(crate) struct MessagesResponse {
 }
 
 #[derive(serde::Serialize)]
-struct MessagesUsage {
+pub(crate) struct MessagesUsage {
     input_tokens: usize,
     output_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

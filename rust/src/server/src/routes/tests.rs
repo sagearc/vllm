@@ -4657,36 +4657,40 @@ async fn health_endpoint_returns_503_after_engine_core_dead_sentinel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn load_endpoint_resets_when_stream_response_is_dropped() {
-    let (app, engine_task) = test_app_with_engine_handle().await;
+    for (uri, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "prompt": "hello", "stream": true}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 10, "stream": true}),
+        ),
+    ] {
+        let (app, engine_task) = test_app_with_engine_handle().await;
 
-    let response = app
-        .clone()
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "prompt": "hello",
-                        "stream": true
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
+        let response = app
+            .clone()
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(server_load(&app).await, 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(server_load(&app).await, 1);
 
-    drop(response);
-    tokio::task::yield_now().await;
-    engine_task.await.expect("mock engine task");
+        drop(response);
+        tokio::task::yield_now().await;
+        engine_task.await.expect("mock engine task");
 
-    assert_eq!(server_load(&app).await, 0);
+        assert_eq!(server_load(&app).await, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4830,6 +4834,11 @@ async fn engine_request_errors_map_to_http_status() {
                 status,
             ),
             (
+                "/v1/messages",
+                json!({"model":model,"messages":messages,"max_tokens":10,"stream":true}),
+                StatusCode::OK,
+            ),
+            (
                 "/v1/completions",
                 json!({"model": model, "prompt": "hello"}),
                 status,
@@ -4883,7 +4892,18 @@ async fn engine_request_errors_map_to_http_status() {
             engine_task.await.expect("mock engine task");
             let text = String::from_utf8(body.to_vec()).expect("utf8 body");
             if uri == "/v1/messages" {
-                let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let body: serde_json::Value =
+                    if request["stream"] == true {
+                        let events: Vec<serde_json::Value> = sse_data_payloads(&text)
+                            .iter()
+                            .map(|event| serde_json::from_str(event).unwrap())
+                            .collect();
+                        assert!(!events.iter().any(|event| event["type"] == "message_stop"
+                            || event["type"] == "message_delta"));
+                        events.last().unwrap().clone()
+                    } else {
+                        serde_json::from_str(&text).unwrap()
+                    };
                 assert_eq!(
                     body,
                     json!({"type": "error", "error": {"type": anthropic_error_type, "message": error.message}})
@@ -10763,6 +10783,109 @@ async fn anthropic_assistant_prefix_count_matches_generation_without_echo() {
     assert_eq!(
         response["content"],
         json!([{"type": "text", "text": "continuation"}])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_stream_preserves_text_order_and_terminal_usage() {
+    let (mut app, engine_task) = test_app_with_stream_output_specs(vec![
+        (bytes_to_token_ids(b"Hel"), None),
+        (
+            bytes_to_token_ids(b"lo"),
+            Some(EngineCoreFinishReason::Length),
+        ),
+    ])
+    .await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 5, "stream": true,
+                        "messages": [{"role": "user", "content": "Hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    engine_task.await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!text.contains("[DONE]"));
+    let events: Vec<serde_json::Value> = sse_data_payloads(&text)
+        .iter()
+        .map(|value| serde_json::from_str(value).unwrap())
+        .collect();
+    assert_eq!(events[0]["message"]["role"], "assistant");
+    assert_eq!(events[0]["message"]["content"], json!([]));
+    let types: Vec<_> = events.iter().map(|event| event["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ]
+    );
+    let content: String =
+        events.iter().filter_map(|event| event["delta"]["text"].as_str()).collect();
+    assert_eq!(content, "Hello");
+    assert_eq!(
+        events[5]["delta"],
+        json!({"stop_reason": "max_tokens", "stop_sequence": null})
+    );
+    assert_eq!(events[5]["usage"]["output_tokens"], 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn anthropic_stream_error_does_not_report_success() {
+    let (mut app, engine_task) = test_app_with_stream_output_specs(vec![
+        (bytes_to_token_ids(b"partial"), None),
+        (vec![], Some(EngineCoreFinishReason::Error)),
+    ])
+    .await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 10, "stream": true,
+                        "messages": [{"role": "user", "content": "Hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    engine_task.await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let events: Vec<serde_json::Value> = sse_data_payloads(&text)
+        .iter()
+        .map(|value| serde_json::from_str(value).unwrap())
+        .collect();
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(events.last().unwrap()["error"]["type"], "api_error");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "message_stop" || event["type"] == "message_delta")
     );
 }
 

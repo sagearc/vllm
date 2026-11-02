@@ -16,17 +16,17 @@ This means any model served by vLLM with proper tool calling support can act as 
 
 ## Rust frontend support
 
-The Rust frontend supports `/v1/messages/count_tokens` and non-streaming
+The Rust frontend supports `/v1/messages/count_tokens` and streaming or non-streaming
 `/v1/messages` for text conversations with a top-level system prompt. Generation
 accepts `max_tokens`, `temperature`, `top_p`, `top_k`, and `stop_sequences`.
 Counting accepts the same request fields but does not require `max_tokens`.
 `temperature` must be between 0 and 1, inclusive, following the Anthropic API.
 A final assistant message containing non-empty text is continued; token counting
 uses the same continuation prompt. Both endpoints reuse the shared chat renderer
-and tokenizer. Streaming, other content types, and other request options return
+and tokenizer. Other content types and other request options return
 an error. Authentication uses the existing bearer-token configuration.
 Request failures use Anthropic error envelopes. Retryable engine rejections return
-HTTP 503.
+HTTP 503; failures after streaming starts are delivered as SSE error events.
 Use `VLLM_USE_RUST_FRONTEND=0` for the Claude Code workflow below.
 
 ## Requirements

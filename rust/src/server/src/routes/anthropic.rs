@@ -3,13 +3,15 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt as _;
+
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
-use crate::anthropic::{MessagesLlm, MessagesRequest};
+use crate::anthropic::{MessagesLlm, MessagesOutput, MessagesRequest};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::utils::resolve_request_context;
@@ -84,7 +86,25 @@ pub async fn messages(
         .create(body, &model, resolve_request_context(&headers, None))
         .await
     {
-        Ok(response) => Json(response).into_response(),
+        Ok(MessagesOutput::Full(response)) => Json(response).into_response(),
+        Ok(MessagesOutput::Stream(events)) => crate::utils::sse_response(
+            events.map(|event| {
+                let body = match event {
+                    Ok(event) => {
+                        serde_json::to_value(event).expect("Messages event must serialize")
+                    }
+                    Err(error) => serde_json::to_value(error_body(error))
+                        .expect("Messages error must serialize"),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default()
+                        .event(body["type"].as_str().expect("event type"))
+                        .json_data(body)
+                        .expect("Messages event must serialize"),
+                )
+            }),
+            state.api_server_options.sse_keep_alive_interval,
+        ),
         Err(error) => error_response(error),
     }
 }
