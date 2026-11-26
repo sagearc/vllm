@@ -274,6 +274,7 @@ fn serve_args_forward_python_flags_with_separator() {
         Cli {
             command: Serve(
                 ServeArgs {
+                    remote_generation_url: None,
                     headless: false,
                     host: "127.0.0.1",
                     port: 8000,
@@ -1441,6 +1442,25 @@ fn int_flag_parses_like_python_bool_int() {
         "true" -> Err("`true` is not an integer")
         "" -> Err("`` is not an integer")"#]]
     .assert_eq(&parsed);
+}
+
+#[test]
+fn serve_parses_remote_generation_and_model_limit() {
+    let url = "http://127.0.0.1:50051";
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--remote-generation-url",
+        url,
+        "--max-model-len=1K",
+    ])
+    .unwrap();
+    let Command::Serve(serve) = cli.command else {
+        panic!("expected serve args");
+    };
+    assert_eq!(serve.remote_generation_url.as_deref(), Some(url));
+    assert_eq!(serve.remote_max_model_len().unwrap().unwrap().get(), 1024);
 }
 
 #[test]
@@ -3596,6 +3616,7 @@ fn serve_args_accept_handshake_aliases() {
         Cli {
             command: Serve(
                 ServeArgs {
+                    remote_generation_url: None,
                     headless: false,
                     host: "127.0.0.1",
                     port: 8000,
