@@ -3905,6 +3905,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
         FrontendConfig {
             server: ServerConfig {
                 model: "Qwen/Qwen3-0.6B",
+                max_model_len: None,
                 revision: None,
                 tokenizer: None,
                 hf_config: None,
@@ -4058,6 +4059,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
         FrontendConfig {
             server: ServerConfig {
                 model: "Qwen/Qwen3-0.6B",
+                max_model_len: None,
                 revision: None,
                 tokenizer: None,
                 hf_config: None,
@@ -4318,6 +4320,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
         FrontendConfig {
             server: ServerConfig {
                 model: "Qwen/Qwen3-0.6B",
+                max_model_len: None,
                 revision: None,
                 tokenizer: None,
                 hf_config: None,
