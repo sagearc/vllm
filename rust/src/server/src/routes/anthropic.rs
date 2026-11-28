@@ -108,7 +108,7 @@ pub(super) async fn messages(
             LoggedOutput::Response,
             Some(&completion.token_ids),
         );
-        let content = convert_output_blocks(completion.message.content)?;
+        let content = convert_output_blocks(completion.message.content, reason)?;
         Ok::<_, ApiError>(MessagesResponse {
             id: request_id,
             role: "assistant",

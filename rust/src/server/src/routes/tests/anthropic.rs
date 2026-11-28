@@ -143,6 +143,37 @@ async fn model_specific_parsers_produce_anthropic_thinking_and_tool_use() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn max_tokens_during_final_tool_call_preserves_both_calls() {
+    let output = concat!(
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>",
+        r#"{"city":"Paris"}"#,
+        "<|tool_call_end|>",
+        "<|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>",
+        r#"{"city":"#,
+    );
+    let (mut app, engine_task) = test_app_with_backend_and_stream_output_specs(
+        Arc::new(FakeChatBackend::with_model_id("moonshotai/Kimi-K2.5")),
+        vec![(token_ids(output), Some(EngineCoreFinishReason::Length))],
+    )
+    .await;
+    let mut body = messages_request();
+    body["tools"] = json!([weather_tool()]);
+    let (status, message) = post_json(&mut app, "/v1/messages", body).await;
+    engine_task.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{message}");
+    assert_eq!(message["stop_reason"], "max_tokens");
+    assert_eq!(
+        message["content"],
+        json!([
+            {"type": "tool_use", "id": "functions.get_weather:0", "name": "get_weather", "input": {"city": "Paris"}},
+            {"type": "tool_use", "id": "functions.get_weather:1", "name": "get_weather", "input": {}}
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn streams_thinking_and_tools_in_order_with_named_events() {
     let (app, engine_task) = test_app_with_backend_and_stream_output_specs(
         Arc::new(FakeChatBackend::with_model_id("Qwen/Qwen3-0.6B")),

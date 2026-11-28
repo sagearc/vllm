@@ -50,23 +50,33 @@ impl AnthropicError {
 
 pub(super) fn convert_output_blocks(
     blocks: Vec<AssistantContentBlock>,
+    reason: Option<MessagesStopReason>,
 ) -> Result<Vec<OutputContentBlock>, ApiError> {
-    let mut content = blocks
-        .into_iter()
-        .map(|block| match block {
-            AssistantContentBlock::Text { text } => Ok(OutputContentBlock::Text { text }),
-            AssistantContentBlock::Reasoning { text } => Ok(OutputContentBlock::Thinking {
+    let token_limit_reached = matches!(reason, Some(MessagesStopReason::MaxTokens));
+    let mut blocks = blocks.into_iter().peekable();
+    let mut content = Vec::with_capacity(blocks.len());
+    while let Some(block) = blocks.next() {
+        content.push(match block {
+            AssistantContentBlock::Text { text } => OutputContentBlock::Text { text },
+            AssistantContentBlock::Reasoning { text } => OutputContentBlock::Thinking {
                 thinking: text,
                 signature: thinking_signature(),
-            }),
-            AssistantContentBlock::ToolCall(call) => Ok(OutputContentBlock::ToolUse {
-                input: parse_tool_input(&call.arguments)
-                    .ok_or_else(|| server_error!("Model returned invalid tool arguments"))?,
-                id: call.id,
-                name: call.name,
-            }),
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+            },
+            AssistantContentBlock::ToolCall(call) => {
+                let may_be_truncated = token_limit_reached && blocks.peek().is_none();
+                let input = match parse_tool_input(&call.arguments) {
+                    Ok(input) => input,
+                    Err(error) if may_be_truncated && error.is_eof() => Map::new(),
+                    Err(_) => return Err(server_error!("Model returned invalid tool arguments")),
+                };
+                OutputContentBlock::ToolUse {
+                    id: call.id,
+                    name: call.name,
+                    input,
+                }
+            }
+        });
+    }
     if content.is_empty() {
         content.push(OutputContentBlock::Text {
             text: String::new(),
@@ -79,8 +89,8 @@ pub(super) fn thinking_signature() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-fn parse_tool_input(arguments: &str) -> Option<Map<String, Value>> {
-    serde_json::from_str(arguments).ok()
+fn parse_tool_input(arguments: &str) -> serde_json::Result<Map<String, Value>> {
+    serde_json::from_str(arguments)
 }
 
 pub(super) fn stop_reason<'a>(
@@ -94,7 +104,7 @@ pub(super) fn stop_reason<'a>(
             if let Some(StopReason::Text(text)) = stop {
                 let mut tools = blocks.tool_calls().peekable();
                 if tools.peek().is_none()
-                    || !tools.all(|call| parse_tool_input(&call.arguments).is_some())
+                    || !tools.all(|call| parse_tool_input(&call.arguments).is_ok())
                 {
                     return Ok((Some(MessagesStopReason::StopSequence), Some(text)));
                 }
