@@ -42,10 +42,9 @@ steps:
   commands:
   - export VLLM_USE_RUST_FRONTEND=1
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  # Exercise the same Anthropic SDK wire tests as the Python frontend.
   - >-
     pytest -v -s entrypoints/anthropic/test_messages.py
-    -k 'simple_messages or system_message or anthropic_streaming or anthropic_tool_call or count_tokens_over_max_model_len'
+    -k 'simple_messages or system_message or anthropic_streaming or anthropic_tool_call or count_tokens_over_max_model_len or min_tokens_delays_stop_sequence'
   - pytest -v -s benchmarks/test_serve_cli.py
   # The Rust frontend re-renders messages instead of reusing kv_transfer_params["prompt_token_ids"].
   - pytest -v -s entrypoints/openai/chat_completion/test_chat_completion.py -k "not test_kv_transfer_prompt_token_ids_round_trip and not test_kv_transfer_prompt_token_ids_streaming"

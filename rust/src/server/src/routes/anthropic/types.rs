@@ -8,12 +8,14 @@ use std::marker::PhantomData;
 use serde::de::{IgnoredAny, SeqAccess, Visitor, value::SeqAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
+use vllm_engine_core_client::protocol::multimodal::MmModality;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MessagesInput {
     pub(super) model: String,
     pub(super) messages: Vec<InputMessage>,
     pub(super) system: Option<TextContent>,
+    pub(super) chat_template_kwargs: Option<HashMap<String, Value>>,
     pub(super) thinking: Option<ThinkingConfig>,
     pub(super) tools: Option<Vec<ClientTool>>,
     pub(super) tool_choice: Option<ToolChoice>,
@@ -25,6 +27,7 @@ pub(in crate::routes) struct MessagesRequest {
     #[serde(flatten)]
     pub(super) input: MessagesInput,
     pub(super) max_tokens: u32,
+    pub(super) min_tokens: Option<u32>,
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
     pub(super) top_k: Option<u32>,
@@ -42,7 +45,6 @@ pub(in crate::routes) struct CountTokensRequest {
     #[serde(flatten)]
     pub(super) input: MessagesInput,
     pub(super) output_config: Option<OutputConfig>,
-    pub(super) chat_template_kwargs: Option<HashMap<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +178,30 @@ pub(super) enum ToolResultBlock {
     ToolReference { tool_name: String },
 }
 
+impl MessagesRequest {
+    pub(super) fn media_modalities(&self) -> impl Iterator<Item = MmModality> + '_ {
+        self.input.messages.iter().filter_map(|message| {
+            let InputMessage::User {
+                content: UserContent::Blocks(blocks),
+            } = message
+            else {
+                return None;
+            };
+            blocks
+                .iter()
+                .any(|block| match block {
+                    UserInputBlock::Image { .. } => true,
+                    UserInputBlock::ToolResult {
+                        content: Some(ToolResultContent::Blocks(result)),
+                        ..
+                    } => result.iter().any(|part| matches!(part, ToolResultBlock::Image { .. })),
+                    _ => false,
+                })
+                .then_some(MmModality::Image)
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum AssistantInputBlock {
@@ -239,7 +265,7 @@ pub(super) enum ToolChoiceKind {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ThinkingConfig {
     Enabled {
-        budget_tokens: Option<i64>,
+        budget_tokens: i64,
         // Like Python, always return reasoning and retain it in history.
         #[expect(dead_code, reason = "Display hints do not change reasoning output")]
         display: Option<ThinkingDisplay>,

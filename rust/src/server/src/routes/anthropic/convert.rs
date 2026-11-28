@@ -14,9 +14,7 @@ use super::types::{
     OutputFormat, TextBlock, TextContent, ThinkingConfig, ToolChoice, ToolChoiceKind,
     ToolResultBlock, ToolResultContent, UserContent, UserInputBlock,
 };
-use super::validate::{
-    validate_count_tokens_request, validate_messages_input, validate_messages_request,
-};
+use super::validate::{validate_messages_input, validate_messages_request};
 use crate::error::{ApiError, chat_request_error, invalid_request};
 use crate::lora::LoraModelResolution;
 use crate::utils::ResolvedRequestContext;
@@ -30,10 +28,12 @@ pub(super) fn prepare_messages_request(
     let effort = body.output_config.and_then(|config| config.effort);
     let mut request = prepare_chat_request(body.input, effort, model, ctx)?;
     request.sampling_params.max_tokens = Some(body.max_tokens);
+    request.sampling_params.min_tokens = body.min_tokens;
     request.sampling_params.temperature = body.temperature;
     request.sampling_params.top_p = body.top_p;
     request.sampling_params.top_k = body.top_k;
     request.decode_options.stop_strings = body.stop_sequences;
+    request.decode_options.min_tokens = body.min_tokens.unwrap_or(0);
     request.intermediate = body.stream == Some(true);
     request.cache_salt = body.cache_salt;
     Ok(request)
@@ -44,10 +44,8 @@ pub(super) fn prepare_count_tokens_request(
     model: &LoraModelResolution,
     ctx: ResolvedRequestContext,
 ) -> Result<ChatRequest, ApiError> {
-    validate_count_tokens_request(&body)?;
     let OutputConfig { effort, format } = body.output_config.unwrap_or_default();
     let mut request = prepare_chat_request(body.input, effort, model, ctx)?;
-    request.chat_options.template_kwargs = body.chat_template_kwargs.unwrap_or_default();
     if let Some(OutputFormat::JsonSchema { schema }) = format {
         request.chat_options.response_format = Some(json!({
             "type": "json_schema",
@@ -93,6 +91,7 @@ fn prepare_chat_request(
         },
         chat_options: ChatOptions {
             reasoning_effort,
+            template_kwargs: body.chat_template_kwargs.unwrap_or_default(),
             generation_prompt_mode: if continuation {
                 GenerationPromptMode::ContinueFinalAssistant
             } else {
@@ -125,7 +124,9 @@ fn resolve_thinking(
             // Like Python, between-tools thinking starts with thinking disabled.
             (Some(EffortValue::from("none")), None)
         }
-        Some(ThinkingConfig::Enabled { budget_tokens, .. }) => (reasoning_effort, budget_tokens),
+        Some(ThinkingConfig::Enabled { budget_tokens, .. }) => {
+            (reasoning_effort, Some(budget_tokens))
+        }
         Some(ThinkingConfig::Adaptive { .. }) | None => (reasoning_effort, None),
     }
 }

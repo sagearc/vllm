@@ -59,14 +59,15 @@ pub(super) async fn count_tokens(
     }))
 }
 
-/// Anthropic request handling over the application's shared chat inference.
 pub(super) async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<Json<MessagesRequest>, JsonRejection>,
 ) -> Result<Response, AnthropicError> {
     let Json(body) = body.map_err(ApiError::from)?;
-    let model_resolution = state.resolve_model_with_loras(Some(&body.input.model)).await;
+    let model_resolution = state
+        .resolve_model_with_default_mm_loras(Some(&body.input.model), body.media_modalities())
+        .await;
     let options = state.api_server_options;
     let ctx = resolve_request_context(&headers, "msg_", None)?;
     let request = prepare_messages_request(body, &model_resolution, ctx)?;

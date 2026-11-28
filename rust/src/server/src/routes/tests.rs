@@ -2154,28 +2154,67 @@ async fn static_lora_module_loads_and_lists_with_parent() {
 /// the response `model`; a text-only request stays on the base model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn chat_with_media_uses_default_mm_lora() {
+async fn chat_and_messages_with_media_use_default_mm_lora() {
+    let model = "Qwen/Qwen1.5-0.5B-Chat";
+    let text = json!([{"role": "user", "content": "hello"}]);
+    let image = json!({"type": "image", "source": {
+        "type": "base64", "media_type": "image/png",
+        "data": TINY_PNG_DATA_URI.strip_prefix("data:image/png;base64,").unwrap()
+    }});
+    let cases = [
+        (
+            "/v1/chat/completions",
+            json!([{"role": "user", "content": [
+                {"type": "text", "text": "describe "},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
+            ]}]),
+            Some("image"),
+        ),
+        ("/v1/chat/completions", text.clone(), None),
+        (
+            "/v1/messages",
+            json!([{"role": "user", "content": [image]}]),
+            Some("image"),
+        ),
+        (
+            "/v1/messages",
+            json!([
+                {"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "weather", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": [image]}]}
+            ]),
+            Some("image"),
+        ),
+        ("/v1/messages", text, None),
+    ];
+    let expected_loras = cases.each_ref().map(|(_, _, lora)| *lora);
     let mut ready = default_ready_response();
     ready.supports_lora = true;
     ready.max_loras = 4;
-    let (state, _engine_task) = test_admin_state_with_backend_and_engine_script(
+    let (state, engine_task) = test_admin_state_with_backend_and_engine_script(
         ready,
         Arc::new(FakeChatBackend::with_multimodal_model_info(
             qwen_multimodal_model_info(),
         )),
         |state| state.with_default_mm_lora_modalities(vec![MmModality::Image]),
-        |dealer, push| {
+        move |dealer, push| {
             boxed_test_future(async move {
                 add_lora_script(true, |lora| assert_eq!(lora[0], Value::from("image")))(
                     dealer, push,
                 )
                 .await;
-                for expected_lora in [Some("image"), None] {
+                for expected_lora in expected_loras {
                     let add = recv_engine_message(dealer).await;
                     assert_eq!(add[0].as_ref(), &[0x00]);
                     let request = decode_add_request(&add);
                     let lora = request.lora_request.as_ref().map(|lora| lora.lora_name.as_str());
                     assert_eq!(lora, expected_lora);
+                    if expected_lora.is_some() {
+                        let features = request.mm_features.as_ref().unwrap();
+                        assert_eq!(features.len(), 1);
+                        assert_eq!(features[0].modality, MmModality::Image);
+                        assert!(features[0].data.as_ref().is_some_and(|data| !data.is_empty()));
+                    }
                     send_outputs(
                         push,
                         engine_outputs_for_request(
@@ -2198,37 +2237,13 @@ async fn chat_with_media_uses_default_mm_lora() {
     state.load_static_lora(&module).await.expect("load default mm lora");
     let mut app = build_router_with_gates(state, RouteGates::default());
 
-    let image_content = json!([
-        {"type": "text", "text": "describe "},
-        {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
-    ]);
-    for (content, expected_model) in [
-        (image_content, "image"),
-        (json!("hello"), "Qwen/Qwen1.5-0.5B-Chat"),
-    ] {
-        let response = app
-            .call(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "model": "Qwen/Qwen1.5-0.5B-Chat",
-                            "messages": [{"role": "user", "content": content}],
-                            "max_completion_tokens": 8
-                        })
-                        .to_string(),
-                    ))
-                    .expect("build request"),
-            )
-            .await
-            .expect("call app");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
-        assert_eq!(json["model"], expected_model);
+    for (uri, messages, expected_lora) in cases {
+        let body = json!({"model": model, "max_tokens": 8, "messages": messages});
+        let (status, response) = post_json(&mut app, uri, body).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {response}");
+        assert_eq!(response["model"], expected_lora.unwrap_or(model));
     }
+    engine_task.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

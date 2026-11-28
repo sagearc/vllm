@@ -151,7 +151,6 @@ async fn streams_thinking_and_tools_in_order_with_named_events() {
     .await;
     let mut body = messages_request();
     body["stream"] = json!(true);
-    body["thinking"] = json!({"type": "enabled"});
     body["metadata"] = json!({"user_id": "client-session"});
     body["safeguards"] = json!({});
     body["tools"] = json!([weather_tool()]);
@@ -279,49 +278,6 @@ async fn count_tokens_accepts_tool_call_history() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn tool_result_images_reach_engine_multimodal_features() {
-    let (app, engine_task) = test_app_with_backend_and_engine_request_check(
-        Arc::new(FakeChatBackend::with_multimodal_model_info(
-            qwen_multimodal_model_info(),
-        )),
-        |request| {
-            let features = request.mm_features.as_ref().unwrap();
-            assert_eq!(features.len(), 1);
-            assert_eq!(features[0].modality, MmModality::Image);
-            assert!(features[0].data.as_ref().unwrap().contains_key("pixel_values"));
-            let prompt = decode_prompt_token_ids(request).unwrap();
-            assert!(prompt.contains(&151655));
-        },
-    )
-    .await;
-    let mut body = messages_request();
-    body["messages"].as_array_mut().unwrap().extend([
-        json!({"role": "assistant", "content": [
-            {"type":"tool_use","id":"call_1","name":"get_weather","input":{"city":"Paris"}}
-        ]}),
-        json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": [
-                {"type": "image", "source": {
-                    "type":"base64", "media_type":"image/png",
-                    "data": TINY_PNG_DATA_URI.strip_prefix("data:image/png;base64,").unwrap(),
-                }}
-            ]}
-        ]}),
-    ]);
-    let response = call_messages(&app, body).await;
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    engine_task.await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn stream_error_uses_anthropic_envelope_and_ends_the_stream() {
     let (app, engine_task) = test_app_with_backend_and_stream_output_specs(
         Arc::new(FakeChatBackend::new()),
@@ -385,19 +341,29 @@ async fn dropping_the_messages_stream_aborts_the_engine_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn anthropic_text_generation_reports_content_and_stop() {
-    for (output, finish, text, expected, stop_sequence) in [
+    for (output, finish, min_tokens, text, expected, stop_sequence) in [
         (
             "Hello",
             EngineCoreFinishReason::Length,
+            0,
             "Hello",
             "max_tokens",
             None,
         ),
-        ("", EngineCoreFinishReason::Stop, "", "end_turn", None),
+        ("", EngineCoreFinishReason::Stop, 0, "", "end_turn", None),
         (
             "HelloSTOP",
             EngineCoreFinishReason::Length,
+            0,
             "Hello",
+            "stop_sequence",
+            Some("STOP"),
+        ),
+        (
+            "STOPHiSTOP",
+            EngineCoreFinishReason::Length,
+            4,
+            "STOPHi",
             "stop_sequence",
             Some("STOP"),
         ),
@@ -411,7 +377,7 @@ async fn anthropic_text_generation_reports_content_and_stop() {
             &mut app,
             "/v1/messages",
             json!({
-                "model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 10, "stop_sequences": ["STOP"],
+                "model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 10, "min_tokens": min_tokens, "stop_sequences": ["STOP"],
                 "messages": [{"role": "user", "content": "Hi"}]
             }),
         )
@@ -582,6 +548,7 @@ async fn anthropic_reasoning_output_preserves_blocks_and_usage() {
 // A real HF renderer exposes replayed reasoning and effective effort in the prompt.
 const ANTHROPIC_REASONING_TEMPLATE: &str = concat!(
     "{% if reasoning_effort == 'high' %}{{ raise_exception('Unsupported reasoning effort high') }}{% endif %}",
+    "{{ prompt_prefix | default('') }}",
     "{{ reasoning_effort | default('unset') }}|",
     "{% if enable_thinking is defined %}{{ enable_thinking | tojson }}{% else %}unset{% endif %}|",
     "{% for message in messages %}{{ message.role }}:{{ message.reasoning or '' }}:{{ message.content }};{% endfor %}",
@@ -619,7 +586,7 @@ async fn anthropic_hf_backend(chat_template: &str) -> vllm_chat::DynChatBackend 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn anthropic_replays_thinking_without_signatures_or_redacted_data() {
-    let expected = token_ids("unset|unset|user::Hi;assistant:reason:answer;user::Next;");
+    let expected = token_ids("history:unset|unset|user::Hi;assistant:reason:answer;user::Next;");
     let expected_count = expected.len();
     let backend = anthropic_hf_backend(ANTHROPIC_REASONING_TEMPLATE).await;
     let (mut app, engine_task) = test_app_with_chat_and_engine_request_check(
@@ -628,6 +595,7 @@ async fn anthropic_replays_thinking_without_signatures_or_redacted_data() {
     )
     .await;
     let body = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 64,
+        "chat_template_kwargs": {"prompt_prefix": "history:"},
         "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
         "messages": [{"role": "user", "content": "Hi"},
             {"role": "assistant", "content": [
@@ -697,7 +665,7 @@ async fn anthropic_thinking_controls_reach_renderer_and_engine() {
             },
         )
         .await;
-        let body = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 64,
+        let body = json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "max_tokens": 2048,
             "messages": [{"role": "user", "content": "Hi"}],
             "thinking": thinking, "output_config": {"effort": effort}});
         let (status, count) = post_json(&mut app, "/v1/messages/count_tokens", body.clone()).await;
@@ -714,6 +682,7 @@ async fn anthropic_thinking_controls_reach_renderer_and_engine() {
 async fn anthropic_request_validation_for_generation_and_counting() {
     let (mut app, _engine_task) = test_app().await;
     for overrides in [
+        json!({"thinking": {"type": "enabled"}}),
         json!({"thinking": {"type": "enabled", "budget_tokens": 1023}}),
         json!({"output_config": {"effort": "none"}}),
         json!({"context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}),
@@ -721,6 +690,7 @@ async fn anthropic_request_validation_for_generation_and_counting() {
         json!({"messages": [{"role": "user", "content": [{"type": "thinking", "thinking": "reason"}]}]}),
     ] {
         let mut body = messages_request();
+        body["max_tokens"] = json!(2048);
         body.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
         for endpoint in ["/v1/messages", "/v1/messages/count_tokens"] {
             let (status, response) = post_json(&mut app, endpoint, body.clone()).await;
@@ -729,14 +699,20 @@ async fn anthropic_request_validation_for_generation_and_counting() {
         }
     }
     for (field, value) in [
+        (
+            "thinking",
+            json!({"type": "enabled", "budget_tokens": 1024}),
+        ),
         ("temperature", json!(1.5)),
         ("top_p", json!(1.1)),
+        ("min_tokens", json!(1025)),
         (
             "output_config",
             json!({"format": {"type": "json_schema", "schema": {}}}),
         ),
     ] {
         let mut body = messages_request();
+        body["max_tokens"] = json!(1024);
         body[field] = value;
         let (status, response) = post_json(&mut app, "/v1/messages", body.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {response}");

@@ -15,7 +15,7 @@ mod load;
 mod lora;
 mod metrics;
 pub(crate) mod openai;
-pub(crate) mod output_log;
+mod output_log;
 mod pause;
 mod profile;
 pub(super) mod render;
@@ -140,7 +140,6 @@ fn build_router_with_gates(state: Arc<AppState>, mut gates: RouteGates) -> Route
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))
-        // Anthropic-compatible endpoints
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         // TODO: implement batched chat completions.
