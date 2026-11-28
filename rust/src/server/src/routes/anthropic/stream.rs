@@ -13,7 +13,7 @@ use super::log_completion;
 use super::response::{AnthropicError, convert_usage, stop_reason, thinking_signature};
 use super::types::{MessagesResponse, MessagesStopReason, MessagesUsage, OutputContentBlock};
 use crate::config::ApiServerOptions;
-use crate::error::{ApiError, chat_submit_error, server_error};
+use crate::error::{ApiError, chat_request_error, server_error};
 use crate::routes::output_log::LoggedOutput;
 use crate::utils::EventExt as _;
 
@@ -45,7 +45,7 @@ async fn stream_events(
     // content array has a single index across the ordered block stream.
     let mut block_index = 0;
     while let Some(event) = stream.next().await {
-        match event.map_err(|error| chat_submit_error("Messages stream failed", error))? {
+        match event.map_err(|error| chat_request_error("Messages stream failed", error))? {
             ChatEvent::Start {
                 prompt_token_ids, ..
             } => {

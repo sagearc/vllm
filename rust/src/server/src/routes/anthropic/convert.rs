@@ -17,7 +17,7 @@ use super::types::{
 use super::validate::{
     validate_count_tokens_request, validate_messages_input, validate_messages_request,
 };
-use crate::error::{ApiError, chat_submit_error, invalid_request};
+use crate::error::{ApiError, chat_request_error, invalid_request};
 use crate::lora::LoraModelResolution;
 use crate::utils::ResolvedRequestContext;
 
@@ -85,7 +85,7 @@ fn prepare_chat_request(
     let continuation = matches!(messages.last(), Some(ChatMessage::Assistant { content })
         if content.iter().any(|b| matches!(b, AssistantContentBlock::Text { text } if !text.is_empty())));
     Ok(ChatRequest {
-        request_id: format!("msg_{}", ctx.request_id),
+        request_id: ctx.request_id,
         messages,
         sampling_params: SamplingParams {
             thinking_token_budget,
@@ -153,7 +153,7 @@ fn resolve_tool_context(
         None => (None, true),
     };
     ResolvedToolContext::new(messages, tools, tool_choice, parallel)
-        .map_err(|error| chat_submit_error("invalid Messages tools", error))
+        .map_err(|error| chat_request_error("invalid Messages tools", error))
 }
 
 impl MessagesInput {

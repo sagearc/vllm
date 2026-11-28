@@ -17,6 +17,7 @@ from tests.v1.kv_connector.umbp_test_utils import (
     handshake,
     install_memory_runtime,
     make_kv_caches,
+    mori_has_umbp,
 )
 from tests.v1.kv_connector.unit.utils import (
     create_model_runner_output,
@@ -51,6 +52,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.runtime.embedded import (
     _MoriLookupServer,
     _MoriSchedulerHandle,
     _MoriWorkerHandle,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.scheduler import (
+    UMBPStoreConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import (
     UMBPStoreConnectorWorker,
@@ -373,6 +377,21 @@ def test_runtime_config_rejects_invalid_embedded_dram_options(options, error):
         )
 
 
+@pytest.mark.skipif(not mori_has_umbp(), reason="MORI was built without UMBP")
+def test_embedded_dram_watermarks_default_only_when_neither_is_set():
+    from mori.cpp import UMBPConfig
+
+    unset = UMBPConfig()
+    embedded._configure_dram(unset, {"capacity_bytes": 1024})
+    assert (unset.dram.high_watermark, unset.dram.low_watermark) == (0.99, 0.97)
+
+    # Setting one keeps MORI's default for the other.
+    one = UMBPConfig()
+    embedded._configure_dram(one, {"capacity_bytes": 1024, "dram_high_watermark": 0.95})
+    assert one.dram.high_watermark == 0.95
+    assert one.dram.low_watermark == UMBPConfig().dram.low_watermark
+
+
 def test_mori_client_is_created_only_for_worker(monkeypatch, socket_dir):
     """Scheduler lookup must not allocate a second, unused DRAM store."""
     monkeypatch.setitem(sys.modules, "mori.cpp", None)
@@ -543,6 +562,65 @@ def test_mori_scheduler_routes_lookup_and_clear_to_all_ranks(socket_dir, close_r
             False,
         ]
     finally:
+        for server in servers:
+            server.close()
+
+
+def test_two_phase_lookup_stays_within_each_data_parallel_replica(socket_dir):
+    """With DP2 x TP2 each replica asks only its own ranks, in both phases, and
+    finds only what its own pools hold."""
+
+    class _Pool:
+        def __init__(self, keys):
+            self.keys = set(keys)
+            self.queries = []
+
+        def batch_exists(self, keys):
+            self.queries.append(list(keys))
+            return [key in self.keys for key in keys]
+
+    namespace = "dp-two-phase"
+    topology = RankTopology(tp_size=2)
+    codec = BlockIdentityCodec(UMBPNamespace(namespace))
+    objects = [
+        codec.keys_for_topology(block_hash, topology, (0,))
+        for block_hash in (b"a", b"b", b"c")
+    ]
+    (a0, a1), (b0, b1), (c0, c1) = objects
+    # Replica 0 holds a on both ranks and b on its first; replica 1 holds c on
+    # both ranks and b on its second.
+    pools = {0: (_Pool([a0, b0]), _Pool([a1])), 1: (_Pool([c0]), _Pool([c1, b1]))}
+    schedulers = {}
+    servers = []
+    try:
+        for dp_index, rank_pools in pools.items():
+            vllm_config = _vllm_config(
+                {"mode": "embedded", "lookup_dir": socket_dir},
+                tensor_parallel_size=2,
+                world_size=2,
+                data_parallel_size=2,
+                data_parallel_index=dp_index,
+            )
+            runtime = EmbeddedRuntime.from_config(
+                UMBPRuntimeConfig.from_vllm(vllm_config)
+            )
+            handle = runtime.create_scheduler_handle(namespace, topology, None)
+            assert isinstance(handle, _MoriSchedulerHandle)
+            for rank, pool in zip(topology.all_namespaces(), rank_pools, strict=True):
+                server = _MoriLookupServer(handle._paths[rank], pool)
+                server.start()
+                servers.append(server)
+            schedulers[dp_index] = UMBPStoreConnectorScheduler(
+                vllm_config, _kv_cache_config(), handle, codec, topology
+            )
+
+        assert schedulers[0]._lookup_all_ranks(objects) == [True] * 3 + [False] * 3
+        assert schedulers[1]._lookup_all_ranks(objects) == [False] * 4 + [True] * 2
+        assert [pool.queries for pool in pools[0]] == [[[a0, b0, c0]], [[a1, b1]]]
+        assert [pool.queries for pool in pools[1]] == [[[a0, b0, c0]], [[c1]]]
+    finally:
+        for scheduler in schedulers.values():
+            scheduler.close()
         for server in servers:
             server.close()
 

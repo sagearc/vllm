@@ -24,7 +24,7 @@ use self::types::{
     MessagesStopReason,
 };
 use crate::config::ApiServerOptions;
-use crate::error::{ApiError, chat_submit_error, text_submit_error};
+use crate::error::{ApiError, chat_request_error, text_request_error};
 use crate::routes::openai::utils::validate_max_output_tokens;
 use crate::routes::output_log::LoggedOutput;
 use crate::state::AppState;
@@ -37,20 +37,20 @@ pub(super) async fn count_tokens(
 ) -> Result<impl IntoResponse, AnthropicError> {
     let Json(body) = body.map_err(ApiError::from)?;
     let model_resolution = state.resolve_model_with_loras(Some(&body.input.model)).await;
-    let ctx = resolve_request_context(&headers, None)?;
+    let ctx = resolve_request_context(&headers, "msg_", None)?;
     let request = prepare_count_tokens_request(body, &model_resolution, ctx)?;
     let text_request = state
         .chat
         .request_processor()
         .prepare_for_tokenization(request)
         .await
-        .map_err(|error| chat_submit_error("count_tokens failed", error))?;
+        .map_err(|error| chat_request_error("count_tokens failed", error))?;
     let tokens = state
         .chat
         .text()
         .request_processor()
         .tokenize(text_request)
-        .map_err(|error| text_submit_error("count_tokens failed", error))?;
+        .map_err(|error| text_request_error("count_tokens failed", error))?;
     Ok(Json(CountTokensResponse {
         input_tokens: tokens.len(),
         context_management: ContextManagement {
@@ -68,7 +68,7 @@ pub(super) async fn messages(
     let Json(body) = body.map_err(ApiError::from)?;
     let model_resolution = state.resolve_model_with_loras(Some(&body.input.model)).await;
     let options = state.api_server_options;
-    let ctx = resolve_request_context(&headers, None)?;
+    let ctx = resolve_request_context(&headers, "msg_", None)?;
     let request = prepare_messages_request(body, &model_resolution, ctx)?;
     validate_max_output_tokens(
         "max_tokens",
@@ -84,7 +84,7 @@ pub(super) async fn messages(
         .chat(request)
         .instrument(span.clone())
         .await
-        .map_err(|error| chat_submit_error("failed to submit Messages request", error))?;
+        .map_err(|error| chat_request_error("failed to submit Messages request", error))?;
     if stream_requested {
         return Ok(sse_response(
             stream::messages_stream(event_stream, request_id, response_model, options)
@@ -96,7 +96,7 @@ pub(super) async fn messages(
         let completion = event_stream
             .collect_message()
             .await
-            .map_err(|error| chat_submit_error("failed to collect Messages response", error))?;
+            .map_err(|error| chat_request_error("failed to collect Messages response", error))?;
         let (reason, sequence) = stop_reason(&completion.finish_reason, &completion.message)?;
         log_completion(
             options,
