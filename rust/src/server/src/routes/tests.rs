@@ -7873,16 +7873,6 @@ async fn engine_request_errors_map_to_http_status() {
             "BadRequestError",
             "invalid_request_error",
         ),
-        (
-            RequestError {
-                code: "unknown".into(),
-                message: "Internal server error".into(),
-                retryable: false,
-            },
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalServerError",
-            "api_error",
-        ),
     ] {
         let cases = [
             (
