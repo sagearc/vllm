@@ -42,7 +42,7 @@ impl AnthropicError {
         ErrorResponse {
             error: ErrorDetail {
                 kind,
-                message: error.message(),
+                message: error.to_error_response().error.message,
             },
         }
     }
